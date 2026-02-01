@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: llamacpp
+  labels:
+    app: llamacpp
+spec:
+  selector:
+    matchLabels:
+      app: llamacpp
+  template:
+    metadata:
+      labels:
+        app: llamacpp
+    spec:
+      # Ensure pods run on nodes with AMD GPU
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: gpu.amd.com/gpu
+                operator: Exists
+      containers:
+      - name: llamacpp
+        image: ghcr.io/ggerganov/llama.cpp:server
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: LLAMA_ARG_CTX_SIZE
+          value: "8192"
+        - name: LLAMA_ARG_N_GPU_LAYERS
+          value: "-1"  # Use all GPU layers
+        - name: LLAMA_ARG_HOST
+          value: "0.0.0.0"
+        - name: LLAMA_ARG_PORT
+          value: "8080"
+        # Enable router mode for dynamic model loading
+        - name: LLAMA_ARG_MODEL_ROUTER
+          value: "true"
+        resources:
+          requests:
+            memory: "32Gi"
+            amd.com/gpu: "1"
+          limits:
+            memory: "64Gi"
+            amd.com/gpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        volumeMounts:
+        - name: models
+          mountPath: /models
+          readOnly: true
+        - name: shm
+          mountPath: /dev/shm
+      volumes:
+      - name: models
+        hostPath:
+          path: /data/models
+          type: DirectoryOrCreate
+      # Shared memory for better performance
+      - name: shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+      # Tolerate GPU node taints
+      tolerations:
+      - key: "gpu"
+        operator: "Exists"
+        effect: "NoSchedule"

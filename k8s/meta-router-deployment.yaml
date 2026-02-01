@@ -1,0 +1,63 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meta-router
+  labels:
+    app: meta-router
+spec:
+  replicas: 2  # For high availability
+  selector:
+    matchLabels:
+      app: meta-router
+  template:
+    metadata:
+      labels:
+        app: meta-router
+    spec:
+      serviceAccountName: meta-router
+      containers:
+      - name: router
+        image: meta-router:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        envFrom:
+        - configMapRef:
+            name: meta-router-config
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: meta-router
+  labels:
+    app: meta-router
+spec:
+  type: ClusterIP
+  selector:
+    app: meta-router
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http

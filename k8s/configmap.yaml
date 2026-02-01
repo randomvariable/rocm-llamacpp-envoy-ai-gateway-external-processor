@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: meta-router-config
+data:
+  HEALTH_CHECK_INTERVAL: "30"
+  LLAMA_PORT: "8080"
+  NAMESPACE: "default"
+  PORT: "8000"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-config
+data:
+  models.yaml: |
+    # Model configurations for the cluster
+    models:
+      - name: "llama-2-7b"
+        path: "/models/llama-2-7b-chat.gguf"
+        context_size: 8192
+        gpu_layers: -1
+      - name: "llama-2-13b"
+        path: "/models/llama-2-13b-chat.gguf"
+        context_size: 8192
+        gpu_layers: -1
+      - name: "mistral-7b"
+        path: "/models/mistral-7b-instruct.gguf"
+        context_size: 8192
+        gpu_layers: -1
