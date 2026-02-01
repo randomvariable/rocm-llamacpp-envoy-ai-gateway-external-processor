@@ -154,10 +154,11 @@ func (r *MetaRouter) queryROCmSMIAlternative(ctx context.Context, podName string
 	
 	if err != nil {
 		log.Printf("Alternative GPU query failed for pod %s: %v\n", podName, err)
-		// Return default values
+		// Return default values - get from environment or use Strix Halo default
+		defaultVRAM, _ := strconv.ParseUint(getEnv("DEFAULT_VRAM_MB", "131072"), 10, 64)
 		return &ROCmMemoryInfo{
 			DeviceID:   0,
-			VRAMTotal:  128 * 1024, // Assume 128GB for Strix Halo
+			VRAMTotal:  defaultVRAM, // Default from env or 128GB for Strix Halo
 			VRAMUsed:   0,
 		}, nil
 	}

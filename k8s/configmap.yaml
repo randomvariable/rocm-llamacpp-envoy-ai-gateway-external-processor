@@ -8,6 +8,8 @@ data:
   NAMESPACE: "default"
   PORT: "8000"
   USE_ROCM_SMI: "true"  # Enable ROCm SMI for VRAM-aware scheduling
+  DEFAULT_MODEL: "llama-2-7b"  # Default model when none specified
+  DEFAULT_VRAM_MB: "131072"  # Default VRAM size (128GB for Strix Halo)
 ---
 apiVersion: v1
 kind: ConfigMap

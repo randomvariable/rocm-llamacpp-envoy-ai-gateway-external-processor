@@ -264,8 +264,11 @@ func (r *MetaRouter) queryROCmSMI(ctx context.Context, node *NodeState) error {
 }
 
 // estimateVRAMFromModel estimates VRAM usage based on loaded model
+// NOTE: These estimates should be kept in sync with the model configurations
+// in k8s/configmap.yaml or loaded from environment/config in production
 func estimateVRAMFromModel(model string) uint64 {
-	// Rough estimates in MB
+	// Rough estimates in MB based on model size
+	// These are approximations for GGUF Q4_K_M quantization
 	estimates := map[string]uint64{
 		"llama-2-7b":  8000,  // ~8GB
 		"llama-2-13b": 14000, // ~14GB
@@ -276,7 +279,7 @@ func estimateVRAMFromModel(model string) uint64 {
 		return vram
 	}
 	
-	// Default estimate
+	// Default conservative estimate for unknown models
 	return 8000
 }
 
@@ -469,7 +472,9 @@ func (r *MetaRouter) handleCompletions(w http.ResponseWriter, req *http.Request)
 	
 	model := compReq.Model
 	if model == "" {
-		model = "default"
+		// Use a well-known default model instead of ambiguous "default"
+		model = getEnv("DEFAULT_MODEL", "llama-2-7b")
+		log.Printf("No model specified, using default: %s\n", model)
 	}
 	
 	// Try to find a warm node with the model

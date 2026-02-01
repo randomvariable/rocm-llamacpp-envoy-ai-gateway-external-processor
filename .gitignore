@@ -13,6 +13,9 @@ go.work.sum
 # Binary
 meta-router
 
+# Python (cleanup)
+__pycache__/
+
 # IDEs
 .vscode/
 .idea/

@@ -35,19 +35,23 @@ if kubectl get nodes -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVer
     echo ""
     echo "Detected local cluster. Loading image..."
     
-    # Check if kind
-    if kind get clusters &> /dev/null 2>&1; then
-        CLUSTER_NAME=$(kind get clusters | head -n1)
-        if [ -n "$CLUSTER_NAME" ]; then
-            echo "Loading image into kind cluster: $CLUSTER_NAME"
-            kind load docker-image meta-router:latest --name "$CLUSTER_NAME"
+    # Check if kind is installed and running
+    if command -v kind &> /dev/null; then
+        if kind get clusters &> /dev/null 2>&1; then
+            CLUSTER_NAME=$(kind get clusters | head -n1)
+            if [ -n "$CLUSTER_NAME" ]; then
+                echo "Loading image into kind cluster: $CLUSTER_NAME"
+                kind load docker-image meta-router:latest --name "$CLUSTER_NAME"
+            fi
         fi
     fi
     
-    # Check if minikube
-    if minikube status &> /dev/null 2>&1; then
-        echo "Loading image into minikube"
-        minikube image load meta-router:latest
+    # Check if minikube is installed and running
+    if command -v minikube &> /dev/null; then
+        if minikube status &> /dev/null 2>&1; then
+            echo "Loading image into minikube"
+            minikube image load meta-router:latest
+        fi
     fi
 fi
 
