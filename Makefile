@@ -5,12 +5,16 @@ help:
 	@echo "  build       - Build the meta-router Docker image"
 	@echo "  deploy      - Deploy to Kubernetes cluster"
 	@echo "  clean       - Remove deployed resources"
-	@echo "  test        - Run tests (if available)"
-	@echo "  lint        - Run Python linter"
+	@echo "  test        - Run tests"
+	@echo "  lint        - Run Go linter"
 	@echo "  status      - Check deployment status"
+	@echo "  run         - Run locally"
 
 build:
 	docker build -t meta-router:latest .
+
+build-local:
+	go build -o meta-router .
 
 deploy:
 	kubectl apply -k k8s/
@@ -33,12 +37,15 @@ logs-llama:
 	kubectl logs -l app=llamacpp --tail=100 -f
 
 lint:
-	@echo "Running Python linter..."
-	@command -v pylint >/dev/null 2>&1 || { echo "pylint not installed. Installing..."; pip install pylint; }
-	pylint router.py || true
+	@echo "Running Go linter..."
+	@command -v golangci-lint >/dev/null 2>&1 || { echo "golangci-lint not installed"; go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest; }
+	golangci-lint run || true
 
 test:
-	@echo "No tests configured yet"
+	go test -v ./...
+
+run:
+	go run main.go
 
 port-forward:
 	@echo "Forwarding meta-router to localhost:8000"

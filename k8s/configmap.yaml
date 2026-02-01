@@ -7,6 +7,7 @@ data:
   LLAMA_PORT: "8080"
   NAMESPACE: "default"
   PORT: "8000"
+  USE_ROCM_SMI: "true"  # Enable ROCm SMI for VRAM-aware scheduling
 ---
 apiVersion: v1
 kind: ConfigMap

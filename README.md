@@ -41,6 +41,7 @@ This project addresses scheduling and resource utilization challenges in multi-n
 
 - **Warm Node Routing**: Prioritizes nodes with models already loaded in memory
 - **On-Demand Loading**: Loads models dynamically using llama.cpp router mode
+- **VRAM-Aware Scheduling**: Uses ROCm SMI to query GPU VRAM usage and schedule models on the least contended node
 - **Health Monitoring**: Continuous health checks to track node and model status
 - **LiteLLM Compatible**: Drop-in replacement for direct llama.cpp endpoints
 - **High Availability**: Runs multiple router instances for redundancy
@@ -86,6 +87,12 @@ Edit `k8s/configmap.yaml` to configure:
 - `HEALTH_CHECK_INTERVAL`: How often to check node health (default: 30 seconds)
 - `LLAMA_PORT`: Port where llama.cpp is listening (default: 8080)
 - `NAMESPACE`: Kubernetes namespace (default: default)
+- `USE_ROCM_SMI`: Enable ROCm SMI for VRAM-aware scheduling (default: true)
+
+When `USE_ROCM_SMI` is enabled, the router will:
+- Query GPU VRAM usage on each node during health checks
+- Select the node with the least VRAM usage when loading new models
+- Display VRAM usage in the `/status` endpoint
 
 Edit `k8s/llamacpp-daemonset.yaml` to configure llama.cpp settings:
 
@@ -127,8 +134,29 @@ Check router health and node status:
 # Health check
 curl http://meta-router:8000/health
 
-# Detailed status
+# Detailed status with VRAM usage
 curl http://meta-router:8000/status
+```
+
+Example status output:
+```json
+{
+  "nodes": [
+    {
+      "hostname": "llamacpp-abc123",
+      "endpoint": "http://10.1.2.3:8080",
+      "is_healthy": true,
+      "is_warm": true,
+      "model": "llama-2-7b",
+      "vram_used_mb": 8192,
+      "vram_total_mb": 131072,
+      "vram_percent": 6.25
+    }
+  ],
+  "model_to_nodes": {
+    "llama-2-7b": ["llamacpp-abc123"]
+  }
+}
 ```
 
 ## Development
@@ -137,7 +165,7 @@ curl http://meta-router:8000/status
 
 ```bash
 # Install dependencies
-pip install -r requirements.txt
+go mod download
 
 # Set environment variables
 export NAMESPACE=default
@@ -145,7 +173,7 @@ export LLAMA_PORT=8080
 export PORT=8000
 
 # Run the router
-python router.py
+go run main.go
 ```
 
 ### Testing
@@ -157,7 +185,7 @@ Test the router with a local llama.cpp instance:
 llama-server --model /path/to/model.gguf --port 8080
 
 # In another terminal, start the router
-python router.py
+go run main.go
 ```
 
 ## Troubleshooting
