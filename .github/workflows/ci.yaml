@@ -47,9 +47,6 @@ jobs:
           go-version-file: "go.mod"
           cache: true
 
-      - name: Download dependencies
-        run: go mod download
-
       - name: Run tests with coverage
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
@@ -177,5 +174,15 @@ jobs:
       - name: Build binary
         run: make build
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build Docker image
-        run: make docker-build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: external-processor:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

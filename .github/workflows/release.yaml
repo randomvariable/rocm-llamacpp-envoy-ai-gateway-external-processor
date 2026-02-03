@@ -106,6 +106,7 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
             GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
 
   generate-sbom:
     name: Generate SBOM

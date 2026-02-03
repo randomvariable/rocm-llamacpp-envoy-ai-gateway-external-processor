@@ -101,17 +101,14 @@ func Initialize(ctx context.Context, cfg *Config) (*Provider, error) {
 	provider := &Provider{}
 
 	// Create resource with service information.
-	res, err := resource.Merge(
-		resource.Default(),
-		resource.NewWithAttributes(
-			semconv.SchemaURL,
-			semconv.ServiceName(pkgversion.ServiceName),
-			semconv.ServiceVersion(pkgversion.GetVersion()),
-		),
+	// Note: We create a single resource with all attributes instead of merging
+	// to avoid conflicting schema URL errors. This prevents issues like:
+	// "conflicting Schema URL: https://opentelemetry.io/schemas/1.40.0 and https://opentelemetry.io/schemas/1.26.0"
+	res := resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceName(pkgversion.ServiceName),
+		semconv.ServiceVersion(pkgversion.GetVersion()),
 	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to merge resource: %w", err)
-	}
 
 	// Setup trace provider if OTLP traces are enabled.
 	if cfg.OTLPTracesEnabled && cfg.OTLPEndpoint != "" {

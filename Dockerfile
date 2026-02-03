@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # Copyright 2026 Naadir Jeewa
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,18 +26,22 @@ ARG BUILD_DATE
 
 WORKDIR /workspace
 
-# Copy go mod files
+# Copy go mod files (separate layer for better caching)
 COPY go.mod go.sum ./
 
-# Download dependencies
-RUN go mod download
+# Download dependencies (cached unless go.mod/go.sum change)
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  go mod download
 
 # Copy source code
 COPY cmd/ cmd/
 COPY pkg/ pkg/
 
-# Build with version injection
-RUN CGO_ENABLED=0 GOOS=linux go build -a \
+# Build with version injection (cached unless source changes)
+RUN --mount=type=cache,target=/go/pkg/mod \
+  --mount=type=cache,target=/root/.cache/go-build \
+  CGO_ENABLED=0 GOOS=linux go build \
   -ldflags "-X sigs.k8s.io/release-utils/version.gitVersion=${VERSION} \
   -X sigs.k8s.io/release-utils/version.gitCommit=${GIT_COMMIT} \
   -X sigs.k8s.io/release-utils/version.gitTreeState=${GIT_TREE_STATE} \

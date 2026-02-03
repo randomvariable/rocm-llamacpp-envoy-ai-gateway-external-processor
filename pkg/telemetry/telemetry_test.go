@@ -17,6 +17,7 @@
 package telemetry
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -118,5 +119,49 @@ func TestProviderShutdownEmpty(t *testing.T) {
 	err := provider.Shutdown(t.Context())
 	if err != nil {
 		t.Errorf("Shutdown should not error with empty funcs: %v", err)
+	}
+}
+
+// TestInitializeNoSchemaURLConflict ensures that telemetry initialization
+// does not fail with conflicting schema URL errors. This test addresses the issue:
+// "failed to merge resource: conflicting Schema URL: https://opentelemetry.io/schemas/1.39.0
+// and https://opentelemetry.io/schemas/1.26.0"
+func TestInitializeNoSchemaURLConflict(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+
+	cfg := &Config{
+		OTLPEndpoint:                  "",
+		OTLPTracesEnabled:             false,
+		OTLPMetricsEnabled:            false,
+		PrometheusEnabled:             true,
+		RuntimeInstrumentationEnabled: false,
+		HostInstrumentationEnabled:    false,
+		MetricInterval:                DefaultMetricInterval,
+	}
+
+	provider, err := Initialize(ctx, cfg)
+	if err != nil {
+		t.Fatalf("Initialize failed: %v", err)
+	}
+
+	t.Cleanup(func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+
+		err := provider.Shutdown(shutdownCtx)
+		if err != nil {
+			t.Errorf("provider.Shutdown failed: %v", err)
+		}
+	})
+
+	if provider == nil {
+		t.Fatal("Initialize returned nil provider")
+	}
+
+	if provider.MeterProvider == nil {
+		t.Fatal("MeterProvider should not be nil")
 	}
 }

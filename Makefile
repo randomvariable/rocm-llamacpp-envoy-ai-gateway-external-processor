@@ -98,9 +98,9 @@ license: $(ADDLICENSE)
 license-check: $(ADDLICENSE)
 	$(ADDLICENSE) -c "Naadir Jeewa" -l apache -s -check ./
 
-# Build the docker image
+# Build the docker image with BuildKit caching
 docker-build:
-	docker build -t ${IMG} .
+	DOCKER_BUILDKIT=1 docker build -t ${IMG} .
 
 # Push the docker image
 docker-push:
