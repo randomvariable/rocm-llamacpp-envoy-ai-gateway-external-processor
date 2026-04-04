@@ -1,0 +1,23 @@
+deployments/epp/epp.yaml
+  2c166ef0b1041d15 114
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "23fca067f12227cf9dc866a236b54d7cd82eebd4",
+  "prompts": {
+    "2c166ef0b1041d15": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bdf17ad9-721d-42f2-8f7e-6bb5ad2c8ecc",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Naadir Jeewa",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 0,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
