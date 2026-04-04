@@ -111,6 +111,7 @@ spec:
         - --metrics-port=9090
         - --secure-serving
         - --cert-path=/etc/extproc/tls
+        - --enable-cert-reload
         - --config-file=/etc/epp/epp-config.yaml
         env:
         - name: POD_NAMESPACE
