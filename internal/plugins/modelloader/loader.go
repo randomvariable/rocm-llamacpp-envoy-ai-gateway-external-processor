@@ -35,6 +35,8 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/requestcontrol"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling/types"
+
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/modeltracker"
 )
 
 const (
@@ -112,6 +114,11 @@ type Plugin struct {
 
 	// HTTP client for model server communication.
 	httpClient *http.Client
+
+	// Tracker (optional) receives proactive MarkLoaded notifications
+	// the instant a load is initiated/confirmed so the loaded-model
+	// filter doesn't race during the 10s poll window. Nil-safe.
+	tracker *modeltracker.Tracker
 }
 
 // Compile-time interface checks.
@@ -119,6 +126,23 @@ var (
 	_ plugins.Plugin            = &Plugin{}
 	_ requestcontrol.PreRequest = &Plugin{}
 )
+
+// ModelLoaderDeps holds optional dependencies for the model-loader.
+// The tracker is the link from "cold-load just started" to "filter sees
+// pod as warm immediately" without waiting for the next /v1/models poll.
+type ModelLoaderDeps struct {
+	Tracker *modeltracker.Tracker
+}
+
+// Global deps — set before plugin registration, similar to vram-scorer.
+var loaderDeps *ModelLoaderDeps
+
+// SetModelLoaderDeps wires the tracker into the modelloader plugin.
+// Must be called before RegisterAllPlugins(). Nil tracker is allowed
+// for tests/standalone use.
+func SetModelLoaderDeps(deps *ModelLoaderDeps) {
+	loaderDeps = deps
+}
 
 // ModelLoaderFactory creates a new ModelLoader plugin instance.
 //
@@ -133,7 +157,12 @@ func ModelLoaderFactory(name string, rawParameters json.RawMessage, _ plugins.Ha
 		}
 	}
 
-	return NewPlugin(name, config), nil
+	p := NewPlugin(name, config)
+	if loaderDeps != nil {
+		p.tracker = loaderDeps.Tracker
+	}
+
+	return p, nil
 }
 
 // NewPlugin creates a new ModelLoader plugin with the given configuration.
@@ -152,6 +181,14 @@ func NewPlugin(name string, config Config) *Plugin {
 	}
 }
 
+// WithTracker attaches a tracker for tests that need it without going
+// through the global deps path.
+func (p *Plugin) WithTracker(t *modeltracker.Tracker) *Plugin {
+	p.tracker = t
+
+	return p
+}
+
 // TypedName returns the type and name of this plugin.
 func (p *Plugin) TypedName() plugins.TypedName {
 	return p.typedName
@@ -163,17 +200,17 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 	klog.Info("ModelLoader.PreRequest: called")
 
 	// Validate inputs and extract model/pod info.
-	modelName, podIP := p.validateAndExtractPreRequestInfo(request, schedulingResult)
+	modelName, podIP, podKey := p.validateAndExtractPreRequestInfo(request, schedulingResult)
 	if modelName == "" || podIP == "" {
 		return
 	}
 
-	klog.V(logVerbosity).Infof("ModelLoader.PreRequest: checking model %s on pod (IP: %s)", modelName, podIP)
+	klog.V(logVerbosity).Infof("ModelLoader.PreRequest: checking model %s on pod %s (IP: %s)", modelName, podKey, podIP)
 
 	// Check if model is already loaded or currently loading.
 	loadKey := fmt.Sprintf("%s:%s", podIP, modelName)
 
-	if p.handleAlreadyLoadedOrLoading(ctx, loadKey, modelName, podIP) {
+	if p.handleAlreadyLoadedOrLoading(ctx, loadKey, modelName, podKey, podIP) {
 		return
 	}
 
@@ -182,20 +219,47 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 		p.mu.Lock()
 		p.loadedModels[loadKey] = time.Now()
 		p.mu.Unlock()
-		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s confirmed loaded on pod %s", modelName, podIP)
+		p.markTrackerLoaded(podKey, modelName)
+		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s confirmed loaded on pod %s", modelName, podKey)
 
 		return
 	}
+
+	// Mark proactively BEFORE the slow HTTP load so concurrent requests
+	// in this poll window see the pod as warm and route here instead of
+	// triggering redundant cold-loads on the other pod.
+	p.markTrackerLoaded(podKey, modelName)
 
 	// Model not loaded - trigger load.
 	err := p.loadModel(ctx, podIP, modelName)
 	if err != nil {
-		klog.Errorf("ModelLoader.PreRequest: failed to load model %s on pod %s: %v", modelName, podIP, err)
+		klog.Errorf("ModelLoader.PreRequest: failed to load model %s on pod %s: %v", modelName, podKey, err)
+		// Retract the optimistic MarkLoaded so the next decision doesn't
+		// route to a pod that doesn't actually have the model.
+		p.markTrackerUnloaded(podKey, modelName)
 		// Continue anyway - let the backend report the error if model is truly not available.
 		return
 	}
 
-	klog.Infof("ModelLoader.PreRequest: successfully loaded model %s on pod %s", modelName, podIP)
+	klog.Infof("ModelLoader.PreRequest: successfully loaded model %s on pod %s", modelName, podKey)
+}
+
+// markTrackerLoaded is a nil-safe wrapper around tracker.MarkLoaded.
+func (p *Plugin) markTrackerLoaded(podKey, modelName string) {
+	if p.tracker == nil || podKey == "" {
+		return
+	}
+
+	p.tracker.MarkLoaded(podKey, modelName)
+}
+
+// markTrackerUnloaded is a nil-safe wrapper around tracker.MarkUnloaded.
+func (p *Plugin) markTrackerUnloaded(podKey, modelName string) {
+	if p.tracker == nil || podKey == "" {
+		return
+	}
+
+	p.tracker.MarkUnloaded(podKey, modelName)
 }
 
 // ClearLoadedModelsCache clears the loaded models cache.
@@ -208,15 +272,16 @@ func (p *Plugin) ClearLoadedModelsCache() {
 }
 
 // validateAndExtractPreRequestInfo validates the request and scheduling result,
-// logging details and returning the model name and pod IP if valid.
+// logging details and returning the model name, pod IP, and pod key
+// ("namespace/name", used as the tracker key) if valid.
 func (p *Plugin) validateAndExtractPreRequestInfo(
 	request *types.LLMRequest,
 	schedulingResult *types.SchedulingResult,
-) (modelName, podIP string) {
+) (modelName, podIP, podKey string) {
 	if request == nil {
 		klog.Info("ModelLoader.PreRequest: request is nil, skipping")
 
-		return "", ""
+		return "", "", ""
 	}
 
 	klog.Infof("ModelLoader.PreRequest: request.TargetModel=%q", request.TargetModel)
@@ -224,7 +289,7 @@ func (p *Plugin) validateAndExtractPreRequestInfo(
 	if schedulingResult == nil {
 		klog.Info("ModelLoader.PreRequest: schedulingResult is nil, skipping")
 
-		return "", ""
+		return "", "", ""
 	}
 
 	klog.Infof("ModelLoader.PreRequest: schedulingResult.PrimaryProfileName=%q, ProfileResults count=%d",
@@ -236,31 +301,33 @@ func (p *Plugin) validateAndExtractPreRequestInfo(
 	if modelName == "" {
 		klog.Info("ModelLoader.PreRequest: no target model specified, skipping")
 
-		return "", ""
+		return "", "", ""
 	}
 
 	targetPod := p.getTargetPod(schedulingResult)
 	if targetPod == nil {
 		klog.Info("ModelLoader.PreRequest: no target pod in scheduling result, skipping (getTargetPod returned nil)")
 
-		return "", ""
+		return "", "", ""
 	}
 
 	podInfo := targetPod.GetPod()
 	if podInfo == nil {
 		klog.Warning("ModelLoader.PreRequest: targetPod.GetPod() returned nil")
 
-		return "", ""
+		return "", "", ""
 	}
 
 	podIP = podInfo.Address
 	if podIP == "" {
 		klog.Warningf("ModelLoader.PreRequest: target pod %s has no IP address", podInfo.NamespacedName.String())
 
-		return "", ""
+		return "", "", ""
 	}
 
-	return modelName, podIP
+	podKey = podInfo.NamespacedName.String()
+
+	return modelName, podIP, podKey
 }
 
 // logProfileResults logs details about each profile result for debugging.
@@ -297,11 +364,13 @@ func (p *Plugin) logProfileResults(schedulingResult *types.SchedulingResult) {
 
 // handleAlreadyLoadedOrLoading checks if the model is already loaded or loading.
 // Returns true if the caller should return early (model handled), false otherwise.
-func (p *Plugin) handleAlreadyLoadedOrLoading(ctx context.Context, loadKey, modelName, podIP string) bool {
+// podKey ("namespace/name") is used to update the tracker; podIP is for logs.
+func (p *Plugin) handleAlreadyLoadedOrLoading(ctx context.Context, loadKey, modelName, podKey, podIP string) bool {
 	p.mu.RLock()
 
 	if _, loaded := p.loadedModels[loadKey]; loaded {
 		p.mu.RUnlock()
+		p.markTrackerLoaded(podKey, modelName)
 		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s already loaded on pod %s", modelName, podIP)
 
 		return true

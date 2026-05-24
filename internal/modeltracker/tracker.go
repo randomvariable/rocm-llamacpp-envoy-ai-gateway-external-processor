@@ -244,6 +244,54 @@ func (t *Tracker) SetLoaded(podKey string, models []string) {
 	t.firstPoll = true
 }
 
+// MarkLoaded marks `model` as loaded on `podKey` immediately, without
+// waiting for the next poll. The next poll will overwrite this state
+// with the actual /v1/models response. This is the proactive in-band
+// update path used by the modelloader plugin: when a cold-load is
+// triggered on a specific pod for a specific model, all subsequent
+// filter decisions for the same model within the poll window must see
+// that pod as warm, or the picker races and triggers redundant
+// cold-loads on other pods. (Caught 2026-05-24: Hindsight's 4-pod
+// startup verify fired 4 concurrent gpt-oss-20b calls; both
+// llama-server pods cold-loaded the same model.)
+func (t *Tracker) MarkLoaded(podKey, model string) {
+	if podKey == "" || model == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	set, ok := t.loaded[podKey]
+	if !ok {
+		set = make(PodModelSet)
+		t.loaded[podKey] = set
+	}
+
+	set[model] = struct{}{}
+	t.firstPoll = true
+}
+
+// MarkUnloaded is the inverse of MarkLoaded, used when a cold-load
+// attempt fails. Without it the in-band mark would persist until the
+// next poll and route traffic to a pod that doesn't actually have the
+// model loaded.
+func (t *Tracker) MarkUnloaded(podKey, model string) {
+	if podKey == "" || model == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	set, ok := t.loaded[podKey]
+	if !ok {
+		return
+	}
+
+	delete(set, model)
+}
+
 // pollOnce lists the matching pods, queries each, and atomically
 // updates the loaded-model map.
 func (t *Tracker) pollOnce(ctx context.Context) {

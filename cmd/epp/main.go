@@ -39,6 +39,7 @@ import (
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/modeltracker"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/filter"
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/modelloader"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/scorer"
 	pkgversion "github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/version"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/vram"
@@ -87,6 +88,14 @@ func main() {
 
 	// Set up dependencies for loaded-model filter plugin.
 	filter.SetLoadedModelFilterDeps(&filter.LoadedModelFilterDeps{
+		Tracker: mTracker,
+	})
+
+	// Set up dependencies for model-loader plugin. Sharing the tracker
+	// with the filter lets the loader proactively MarkLoaded the
+	// instant a cold-load starts, so concurrent filter decisions in
+	// the same poll window see the pod as warm.
+	modelloader.SetModelLoaderDeps(&modelloader.ModelLoaderDeps{
 		Tracker: mTracker,
 	})
 

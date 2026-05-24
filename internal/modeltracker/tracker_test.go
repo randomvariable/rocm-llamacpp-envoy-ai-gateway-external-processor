@@ -281,6 +281,106 @@ func TestTracker_AnyPodHasLoaded(t *testing.T) {
 	}
 }
 
+func TestTracker_MarkLoaded_ProactiveBeforePoll(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	// Before MarkLoaded, the tracker thinks the pod has nothing.
+	if tr.IsLoaded("openai/server3", "gpt-oss-20b") {
+		t.Fatal("expected IsLoaded=false before MarkLoaded")
+	}
+
+	// MarkLoaded should flip the result immediately, no poll required.
+	tr.MarkLoaded("openai/server3", "gpt-oss-20b")
+	if !tr.IsLoaded("openai/server3", "gpt-oss-20b") {
+		t.Error("expected IsLoaded=true after MarkLoaded")
+	}
+
+	// Other pod / other model still cold.
+	if tr.IsLoaded("openai/server5", "gpt-oss-20b") {
+		t.Error("MarkLoaded leaked across pods")
+	}
+
+	if tr.IsLoaded("openai/server3", "qwen3.6-35b") {
+		t.Error("MarkLoaded leaked across models")
+	}
+}
+
+func TestTracker_MarkLoaded_Additive(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	tr.SetLoaded("openai/server3", []string{"existing-model"})
+	tr.MarkLoaded("openai/server3", "gpt-oss-20b")
+
+	// Both should be present — MarkLoaded must not overwrite the set.
+	if !tr.IsLoaded("openai/server3", "existing-model") {
+		t.Error("MarkLoaded clobbered existing-model")
+	}
+
+	if !tr.IsLoaded("openai/server3", "gpt-oss-20b") {
+		t.Error("MarkLoaded didn't add gpt-oss-20b")
+	}
+}
+
+func TestTracker_MarkUnloaded(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	tr.MarkLoaded("openai/server3", "gpt-oss-20b")
+	tr.MarkLoaded("openai/server3", "other-model")
+
+	tr.MarkUnloaded("openai/server3", "gpt-oss-20b")
+
+	if tr.IsLoaded("openai/server3", "gpt-oss-20b") {
+		t.Error("MarkUnloaded didn't remove gpt-oss-20b")
+	}
+
+	if !tr.IsLoaded("openai/server3", "other-model") {
+		t.Error("MarkUnloaded clobbered sibling")
+	}
+
+	// MarkUnloaded on a model that wasn't loaded should be a no-op.
+	tr.MarkUnloaded("openai/server3", "never-loaded")
+	tr.MarkUnloaded("openai/unknown-pod", "anything")
+}
+
+func TestTracker_MarkLoaded_EmptyArgs_Noop(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	// Empty strings should be silently dropped, not panic or pollute.
+	tr.MarkLoaded("", "gpt-oss-20b")
+	tr.MarkLoaded("openai/server3", "")
+	tr.MarkUnloaded("", "gpt-oss-20b")
+	tr.MarkUnloaded("openai/server3", "")
+
+	snap := tr.Snapshot()
+	if len(snap) != 0 {
+		t.Errorf("expected empty snapshot, got %+v", snap)
+	}
+}
+
 func TestTracker_BeforeFirstPoll_AllFalse(t *testing.T) {
 	t.Parallel()
 
