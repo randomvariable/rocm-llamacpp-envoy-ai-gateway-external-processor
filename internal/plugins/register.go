@@ -20,6 +20,7 @@ package plugins
 import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/plugins"
 
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/filter"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/modelloader"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/scorer"
 )
@@ -28,6 +29,7 @@ import (
 // This should be called in main() before runner.NewRunner().Run().
 func RegisterAllPlugins() {
 	// Register scheduling plugins.
+	plugins.Register(filter.LoadedModelFilterType, filter.LoadedModelFilterFactory)
 	plugins.Register(scorer.VRAMScorerType, scorer.VRAMScorerFactory)
 
 	// Register request control plugins.

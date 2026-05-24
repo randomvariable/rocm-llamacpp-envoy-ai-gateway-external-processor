@@ -36,7 +36,9 @@ import (
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/gateway-api-inference-extension/cmd/epp/runner"
 
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/modeltracker"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins"
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/filter"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/scorer"
 	pkgversion "github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/version"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/vram"
@@ -44,8 +46,11 @@ import (
 
 // Default configuration values.
 const (
-	defaultExporterNamespace = "kube-system"
-	defaultScrapeInterval    = 30 * time.Second
+	defaultExporterNamespace   = "kube-system"
+	defaultScrapeInterval      = 30 * time.Second
+	defaultModelPollInterval   = 10 * time.Second
+	defaultModelServerPort     = 8080
+	defaultModelQueryPath      = "/models"
 )
 
 func main() {
@@ -71,10 +76,18 @@ func main() {
 	// Start VRAM tracker.
 	tracker := startVRAMTracker(ctx, k8sClient)
 
+	// Start loaded-model tracker (polls /models on each llama-server pod).
+	mTracker := startModelTracker(ctx, k8sClient)
+
 	// Set up dependencies for VRAM scorer plugin.
 	scorer.SetVRAMScorerDeps(&scorer.VRAMScorerDeps{
 		Tracker: tracker,
 		Client:  k8sClient,
+	})
+
+	// Set up dependencies for loaded-model filter plugin.
+	filter.SetLoadedModelFilterDeps(&filter.LoadedModelFilterDeps{
+		Tracker: mTracker,
 	})
 
 	// Register custom plugins.
@@ -100,9 +113,39 @@ func initConfig() {
 	viper.SetDefault("node-selector", map[string]string{"kubernetes.io/gpu": "true"})
 	viper.SetDefault("scrape-interval", defaultScrapeInterval)
 
+	// loaded-model tracker configuration.
+	viper.SetDefault("pod-selector", map[string]string{"app": "llama-server"})
+	viper.SetDefault("model-poll-interval", defaultModelPollInterval)
+	viper.SetDefault("model-server-port", defaultModelServerPort)
+	viper.SetDefault("model-query-path", defaultModelQueryPath)
+
 	viper.SetEnvPrefix("EXTPROC")
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
 	viper.AutomaticEnv()
+}
+
+func startModelTracker(ctx context.Context, k8sClient crclient.Client) *modeltracker.Tracker {
+	namespace := viper.GetString("namespace")
+	podSelector := viper.GetStringMapString("pod-selector")
+	pollInterval := viper.GetDuration("model-poll-interval")
+	port := viper.GetInt("model-server-port")
+	queryPath := viper.GetString("model-query-path")
+
+	klog.Infof("Starting loaded-model tracker: namespace=%s, podSelector=%v, "+
+		"pollInterval=%v, port=%d, queryPath=%s",
+		namespace, podSelector, pollInterval, port, queryPath)
+
+	t := modeltracker.NewTracker(k8sClient, modeltracker.Options{
+		Namespace:    namespace,
+		PodSelector:  podSelector,
+		PodPort:      port,
+		QueryPath:    queryPath,
+		PollInterval: pollInterval,
+	})
+
+	go t.Start(ctx)
+
+	return t
 }
 
 func startVRAMTracker(ctx context.Context, k8sClient crclient.Client) *vram.Tracker {
