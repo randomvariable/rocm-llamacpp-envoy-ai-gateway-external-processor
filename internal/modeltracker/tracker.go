@@ -36,7 +36,6 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -131,9 +130,14 @@ type Tracker struct {
 	pressure        PressureProvider
 	dedupGracePolls int
 
-	mu      sync.RWMutex
-	loaded  map[string]PodModelSet // podKey "namespace/name" -> loaded model IDs
-	podIP   map[string]string      // podKey -> pod IP, refreshed each poll
+	mu sync.RWMutex
+	// loaded is keyed by pod IP — the same identifier the framework hands
+	// scheduling-path callers as the endpoint Address. Keying by IP (not
+	// namespace/name) keeps the poller and the filter/loader in one
+	// keyspace immune to framework endpoint-naming changes (e.g. GIE
+	// v1.3.0's "<ns>/<name>-rank-<idx>").
+	loaded map[string]PodModelSet // pod IP -> loaded model IDs
+	podIP  map[string]string      // tracker key -> routable pod IP, refreshed each poll
 	// dupObs counts how many consecutive polls a model has appeared on
 	// ≥2 pods. Reset to 0 on either dedup action or on the model
 	// returning to a single pod naturally.
@@ -231,7 +235,8 @@ func (t *Tracker) Start(ctx context.Context) {
 }
 
 // IsLoaded returns whether `model` is currently loaded on the pod
-// identified by `podKey` (format: "namespace/name").
+// identified by `podKey`, which is the pod IP (the framework endpoint
+// Address) — the keyspace the poller writes. See the `loaded` field.
 //
 // Returns false if:
 //   - the tracker has never completed a poll
@@ -244,10 +249,6 @@ func (t *Tracker) IsLoaded(podKey, model string) bool {
 	if !t.firstPoll {
 		return false
 	}
-
-	// Scheduling-path callers pass the framework's "<name>-rank-<idx>"
-	// form; the poller stores the plain pod name. Reconcile here.
-	podKey = normalizeKey(podKey)
 
 	set, ok := t.loaded[podKey]
 	if !ok {
@@ -347,10 +348,6 @@ func (t *Tracker) MarkLoaded(podKey, model string) {
 		return
 	}
 
-	// Align the modelloader's framework "<name>-rank-<idx>" key with the
-	// poller's plain pod-name keyspace so IsLoaded can find this mark.
-	podKey = normalizeKey(podKey)
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -372,9 +369,6 @@ func (t *Tracker) MarkUnloaded(podKey, model string) {
 	if podKey == "" || model == "" {
 		return
 	}
-
-	// Match the keyspace used by MarkLoaded / IsLoaded / the poller.
-	podKey = normalizeKey(podKey)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -406,7 +400,15 @@ func (t *Tracker) pollOnce(ctx context.Context) {
 			continue
 		}
 
-		key := podKey(pod)
+		// Key by pod IP, NOT namespace/name. The scheduling-path callers
+		// (loaded-model filter, modelloader) identify a pod by the
+		// framework's endpoint Address (the pod IP); keying here by IP
+		// keeps both sides in one keyspace with zero string-format
+		// coupling. Earlier name-based keying broke when GIE v1.3.0 began
+		// suffixing endpoint names "<ns>/<name>-rank-<idx>". podIP maps
+		// the tracker key to the routable IP for unloads (identity here,
+		// but the indirection lets tests use synthetic keys).
+		key := pod.Status.PodIP
 		nextIPs[key] = pod.Status.PodIP
 
 		set, qErr := t.queryPod(ctx, pod.Status.PodIP)
@@ -528,48 +530,6 @@ func (t *Tracker) queryPod(
 	return set, nil
 }
 
-func podKey(p *corev1.Pod) string {
-	return p.Namespace + "/" + p.Name
-}
-
-// normalizeKey strips a trailing "-rank-<N>" suffix from a pod key.
-//
-// The gateway-api-inference-extension datastore (v1.3.0+) addresses every
-// InferencePool endpoint as "<namespace>/<podname>-rank-<idx>" (idx=0 for
-// single-host pods; see datastore.go AddOrUpdatePod which builds
-// `pod.Name + "-rank-" + strconv.Itoa(idx)`). Scheduling-path callers
-// (the loaded-model filter and the modelloader) therefore pass keys WITH
-// the rank suffix.
-//
-// The loaded-model poller, by contrast, lists raw Pods and keys them as
-// "<namespace>/<podname>" (see podKey). Without reconciling the two forms,
-// IsLoaded never matches the poller's entries, the filter sees zero warm
-// pods, and every request falls through to a cold-load on all pods — the
-// exact failure the filter exists to prevent.
-//
-// Each llama-server is a single-host pod with a unique base name, so
-// collapsing the rank index back to the pod is safe and pod-granular,
-// matching how the tracker polls /models (one process per pod).
-func normalizeKey(podKey string) string {
-	i := strings.LastIndex(podKey, "-rank-")
-	if i < 0 {
-		return podKey
-	}
-
-	suffix := podKey[i+len("-rank-"):]
-	if suffix == "" {
-		return podKey
-	}
-
-	for _, r := range suffix {
-		if r < '0' || r > '9' {
-			return podKey
-		}
-	}
-
-	return podKey[:i]
-}
-
 // resolveDuplicates inspects the just-updated loaded map for models
 // present on ≥2 pods and, after a grace period of consecutive
 // observations, unloads the model from the lowest-pressure pod.
@@ -625,7 +585,7 @@ func (t *Tracker) resolveDuplicates(ctx context.Context) {
 	t.mu.Lock()
 
 	type ripe struct {
-		model string
+		model   string
 		holders []string
 	}
 

@@ -163,7 +163,13 @@ func (f *LoadedModelFilter) Filter(
 			continue
 		}
 
-		key := info.NamespacedName.String()
+		// Identify the pod by its IP (the framework endpoint Address),
+		// NOT NamespacedName. The modeltracker poller keys by pod IP, and
+		// since GIE v1.3.0 the NamespacedName carries a "-rank-<idx>"
+		// suffix that the poller never sees — keying by IP keeps both
+		// sides in one keyspace and the pressure cache correlated with
+		// the dedup's pickLoser. See modeltracker.
+		key := info.Address
 
 		// Side effect: feed the shared pod-state cache so the
 		// modeltracker can score winners during dedup. Cheap copy of

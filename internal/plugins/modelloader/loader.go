@@ -44,16 +44,16 @@ const (
 	ModelLoaderType = "model-loader"
 
 	// Default configuration values.
-	defaultModelServerPort     = 8080
-	defaultModelLoadEndpoint   = "/models/load"
-	defaultModelQueryEndpoint  = "/models"
+	defaultModelServerPort    = 8080
+	defaultModelLoadEndpoint  = "/models/load"
+	defaultModelQueryEndpoint = "/models"
 	// defaultModelLoadTimeout bounds how long PreRequest waits for a
 	// cold-load to actually complete (POST /models/load is async on
 	// llama-server, so we poll /v1/models until status is loaded).
 	// 15 min covers gpt-oss-20b MXFP4 (~30-90s typical) and is a
 	// safety margin for the slowest plausible cold-load on Strix
 	// Halo without leaving requests hanging forever on a hung server.
-	defaultModelLoadTimeout = 15 * time.Minute
+	defaultModelLoadTimeout    = 15 * time.Minute
 	defaultModelQueryTimeout   = 5 * time.Second
 	defaultConcurrentLoadLimit = 2
 
@@ -216,7 +216,7 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 	// Check if model is already loaded or currently loading.
 	loadKey := fmt.Sprintf("%s:%s", podIP, modelName)
 
-	if p.handleAlreadyLoadedOrLoading(ctx, loadKey, modelName, podKey, podIP) {
+	if p.handleAlreadyLoadedOrLoading(ctx, loadKey, modelName, podIP) {
 		return
 	}
 
@@ -225,7 +225,9 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 		p.mu.Lock()
 		p.loadedModels[loadKey] = time.Now()
 		p.mu.Unlock()
-		p.markTrackerLoaded(podKey, modelName)
+		// Tracker is keyed by pod IP (the framework endpoint Address),
+		// NOT NamespacedName — see modeltracker. podKey is for logs only.
+		p.markTrackerLoaded(podIP, modelName)
 		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s confirmed loaded on pod %s", modelName, podKey)
 
 		return
@@ -234,7 +236,7 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 	// Mark proactively BEFORE the slow HTTP load so concurrent requests
 	// in this poll window see the pod as warm and route here instead of
 	// triggering redundant cold-loads on the other pod.
-	p.markTrackerLoaded(podKey, modelName)
+	p.markTrackerLoaded(podIP, modelName)
 
 	// Model not loaded - trigger load.
 	err := p.loadModel(ctx, podIP, modelName)
@@ -242,7 +244,7 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 		klog.Errorf("ModelLoader.PreRequest: failed to load model %s on pod %s: %v", modelName, podKey, err)
 		// Retract the optimistic MarkLoaded so the next decision doesn't
 		// route to a pod that doesn't actually have the model.
-		p.markTrackerUnloaded(podKey, modelName)
+		p.markTrackerUnloaded(podIP, modelName)
 		// Continue anyway - let the backend report the error if model is truly not available.
 		return
 	}
@@ -251,21 +253,24 @@ func (p *Plugin) PreRequest(ctx context.Context, request *types.LLMRequest, sche
 }
 
 // markTrackerLoaded is a nil-safe wrapper around tracker.MarkLoaded.
-func (p *Plugin) markTrackerLoaded(podKey, modelName string) {
-	if p.tracker == nil || podKey == "" {
+// trackerKey is the pod IP (the framework endpoint Address), matching the
+// keyspace the modeltracker poller uses — see modeltracker.
+func (p *Plugin) markTrackerLoaded(trackerKey, modelName string) {
+	if p.tracker == nil || trackerKey == "" {
 		return
 	}
 
-	p.tracker.MarkLoaded(podKey, modelName)
+	p.tracker.MarkLoaded(trackerKey, modelName)
 }
 
 // markTrackerUnloaded is a nil-safe wrapper around tracker.MarkUnloaded.
-func (p *Plugin) markTrackerUnloaded(podKey, modelName string) {
-	if p.tracker == nil || podKey == "" {
+// trackerKey is the pod IP (the framework endpoint Address).
+func (p *Plugin) markTrackerUnloaded(trackerKey, modelName string) {
+	if p.tracker == nil || trackerKey == "" {
 		return
 	}
 
-	p.tracker.MarkUnloaded(podKey, modelName)
+	p.tracker.MarkUnloaded(trackerKey, modelName)
 }
 
 // ClearLoadedModelsCache clears the loaded models cache.
@@ -370,13 +375,13 @@ func (p *Plugin) logProfileResults(schedulingResult *types.SchedulingResult) {
 
 // handleAlreadyLoadedOrLoading checks if the model is already loaded or loading.
 // Returns true if the caller should return early (model handled), false otherwise.
-// podKey ("namespace/name") is used to update the tracker; podIP is for logs.
-func (p *Plugin) handleAlreadyLoadedOrLoading(ctx context.Context, loadKey, modelName, podKey, podIP string) bool {
+// podIP keys the tracker (the framework endpoint Address) and is used for logs.
+func (p *Plugin) handleAlreadyLoadedOrLoading(ctx context.Context, loadKey, modelName, podIP string) bool {
 	p.mu.RLock()
 
 	if _, loaded := p.loadedModels[loadKey]; loaded {
 		p.mu.RUnlock()
-		p.markTrackerLoaded(podKey, modelName)
+		p.markTrackerLoaded(podIP, modelName)
 		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s already loaded on pod %s", modelName, podIP)
 
 		return true

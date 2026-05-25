@@ -22,8 +22,8 @@ import (
 	"sort"
 	"testing"
 
-	k8stypes "k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8stypes "k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	crfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/backend"
@@ -33,14 +33,18 @@ import (
 	pluginfilter "github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/filter"
 )
 
-func mkPod(namespace, name string) types.Pod {
+// mkPod builds a framework pod. addr is the endpoint Address (pod IP) —
+// the identity the filter keys on. Tests seed the tracker by the SAME
+// addr so a regression to NamespacedName-keying (or a framework naming
+// change) makes the lookup miss and the assertions fail.
+func mkPod(namespace, name, addr string) types.Pod {
 	return &types.PodMetrics{
 		Pod: &backend.Pod{
 			NamespacedName: k8stypes.NamespacedName{
 				Namespace: namespace,
 				Name:      name,
 			},
-			Address: "10.0.0.1",
+			Address: addr,
 		},
 	}
 }
@@ -76,14 +80,14 @@ func TestLoadedModelFilter_DropsColdPodsWhenWarmExists(t *testing.T) {
 	t.Parallel()
 
 	tr := newTrackerSeeded(t, map[string][]string{
-		"openai/server3": {"gpt-oss-20b", "qwen3.6-35b"},
-		"openai/server5": {"luminia-8b"},
+		"10.0.0.3": {"gpt-oss-20b", "qwen3.6-35b"},
+		"10.0.0.5": {"luminia-8b"},
 	})
 	f := pluginfilter.NewLoadedModelFilter(tr)
 
 	pods := []types.Pod{
-		mkPod("openai", "server3"),
-		mkPod("openai", "server5"),
+		mkPod("openai", "server3", "10.0.0.3"),
+		mkPod("openai", "server5", "10.0.0.5"),
 	}
 
 	got := f.Filter(
@@ -103,14 +107,14 @@ func TestLoadedModelFilter_PassesThroughWhenNoWarmPod(t *testing.T) {
 	t.Parallel()
 
 	tr := newTrackerSeeded(t, map[string][]string{
-		"openai/server3": {"luminia-8b"},
-		"openai/server5": {"noromaid-7b"},
+		"10.0.0.3": {"luminia-8b"},
+		"10.0.0.5": {"noromaid-7b"},
 	})
 	f := pluginfilter.NewLoadedModelFilter(tr)
 
 	pods := []types.Pod{
-		mkPod("openai", "server3"),
-		mkPod("openai", "server5"),
+		mkPod("openai", "server3", "10.0.0.3"),
+		mkPod("openai", "server5", "10.0.0.5"),
 	}
 
 	got := f.Filter(
@@ -132,14 +136,14 @@ func TestLoadedModelFilter_KeepsAllWhenAllWarm(t *testing.T) {
 	t.Parallel()
 
 	tr := newTrackerSeeded(t, map[string][]string{
-		"openai/server3": {"gpt-oss-20b"},
-		"openai/server5": {"gpt-oss-20b"},
+		"10.0.0.3": {"gpt-oss-20b"},
+		"10.0.0.5": {"gpt-oss-20b"},
 	})
 	f := pluginfilter.NewLoadedModelFilter(tr)
 
 	pods := []types.Pod{
-		mkPod("openai", "server3"),
-		mkPod("openai", "server5"),
+		mkPod("openai", "server3", "10.0.0.3"),
+		mkPod("openai", "server5", "10.0.0.5"),
 	}
 
 	got := f.Filter(
@@ -158,11 +162,11 @@ func TestLoadedModelFilter_NoTargetModel_PassThrough(t *testing.T) {
 	t.Parallel()
 
 	tr := newTrackerSeeded(t, map[string][]string{
-		"openai/server3": {"gpt-oss-20b"},
+		"10.0.0.3": {"gpt-oss-20b"},
 	})
 	f := pluginfilter.NewLoadedModelFilter(tr)
 
-	pods := []types.Pod{mkPod("openai", "server3"), mkPod("openai", "server5")}
+	pods := []types.Pod{mkPod("openai", "server3", "10.0.0.3"), mkPod("openai", "server5", "10.0.0.5")}
 
 	// Empty TargetModel → pass through (no signal to filter on).
 	got := f.Filter(
@@ -193,7 +197,7 @@ func TestLoadedModelFilter_BeforeFirstPoll_PassThrough(t *testing.T) {
 	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
 
 	f := pluginfilter.NewLoadedModelFilter(tr)
-	pods := []types.Pod{mkPod("openai", "server3"), mkPod("openai", "server5")}
+	pods := []types.Pod{mkPod("openai", "server3", "10.0.0.3"), mkPod("openai", "server5", "10.0.0.5")}
 
 	got := f.Filter(
 		context.Background(), nil,
@@ -205,6 +209,44 @@ func TestLoadedModelFilter_BeforeFirstPoll_PassThrough(t *testing.T) {
 		t.Errorf(
 			"expected pass-through before first poll, got %d pods (want %d)",
 			len(got), len(pods),
+		)
+	}
+}
+
+// TestLoadedModelFilter_IPKeyedSurvivesRankSuffix guards the GIE v1.3.0
+// regression directly. The framework decorates each endpoint's
+// NamespacedName as "<ns>/<name>-rank-<idx>", but the tracker poller keys
+// pods by IP. The filter MUST key by Address (pod IP), NOT NamespacedName
+// — otherwise it never matches the poller's entries, sees zero warm pods,
+// and cold-loads on every pod. Here the warm pod's NamespacedName carries
+// a "-rank-0" suffix while the tracker is seeded by its IP; the filter
+// must still keep exactly that pod. A revert to NamespacedName-keying
+// fails this test.
+func TestLoadedModelFilter_IPKeyedSurvivesRankSuffix(t *testing.T) {
+	t.Parallel()
+
+	tr := newTrackerSeeded(t, map[string][]string{
+		"10.0.0.3": {"gpt-oss-20b"},
+	})
+	f := pluginfilter.NewLoadedModelFilter(tr)
+
+	pods := []types.Pod{
+		mkPod("openai", "server3-rank-0", "10.0.0.3"),
+		mkPod("openai", "server5-rank-0", "10.0.0.5"),
+	}
+
+	got := f.Filter(
+		context.Background(), nil,
+		&types.LLMRequest{TargetModel: "gpt-oss-20b"},
+		pods,
+	)
+
+	want := []string{"openai/server3-rank-0"}
+	if diff := podNames(got); !equalStrSlice(diff, want) {
+		t.Errorf(
+			"IP-keyed filter failed with rank-suffixed names "+
+				"(regressed to NamespacedName keying?). got=%v want=%v",
+			diff, want,
 		)
 	}
 }
@@ -225,7 +267,7 @@ func TestLoadedModelFilterFactory_BuildsWithDeps(t *testing.T) {
 	t.Parallel()
 
 	tr := newTrackerSeeded(t, map[string][]string{
-		"openai/server3": {"gpt-oss-20b"},
+		"10.0.0.3": {"gpt-oss-20b"},
 	})
 	pluginfilter.SetLoadedModelFilterDeps(
 		&pluginfilter.LoadedModelFilterDeps{Tracker: tr},

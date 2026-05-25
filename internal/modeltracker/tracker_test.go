@@ -229,10 +229,10 @@ func TestTracker_IsLoaded_seededState(t *testing.T) {
 	tr.SetLoaded("openai/server5", []string{})
 
 	cases := []struct {
-		name    string
-		podKey  string
-		model   string
-		want    bool
+		name   string
+		podKey string
+		model  string
+		want   bool
 	}{
 		{"warm pod warm model", "openai/server3", "gpt-oss-20b", true},
 		{"warm pod cold model", "openai/server3", "luminia-8b", false},
@@ -256,14 +256,16 @@ func TestTracker_IsLoaded_seededState(t *testing.T) {
 	}
 }
 
-// TestTracker_IsLoaded_RankSuffixReconciliation guards the v1.3.0
-// framework regression: the poller keys pods as "<ns>/<name>" while the
-// gateway-api-inference-extension datastore addresses them as
-// "<ns>/<name>-rank-<idx>". IsLoaded/MarkLoaded/MarkUnloaded must
-// reconcile the rank-suffixed scheduling-path keys against the poller's
-// plain keys, or the loaded-model filter sees zero warm pods and every
-// request cold-loads on all pods.
-func TestTracker_IsLoaded_RankSuffixReconciliation(t *testing.T) {
+// TestTracker_KeysByPodIP documents the post-v1.3.0 contract: the tracker
+// keyspace is the pod IP (the framework endpoint Address), and keys are
+// opaque exact-match strings — the tracker does NOT parse or normalize
+// them. Alignment with the framework is achieved by BOTH the poller and
+// the filter/loader using the pod IP, NOT by the tracker stripping a
+// "-rank-<idx>" suffix. (The earlier GIE v1.3.0 regression — poller keyed
+// by "<ns>/<name>" while the filter looked up "<ns>/<name>-rank-<idx>" —
+// is prevented structurally by IP-keying; see the filter package's
+// TestLoadedModelFilter_IPKeyedSurvivesRankSuffix for the end-to-end guard.)
+func TestTracker_KeysByPodIP(t *testing.T) {
 	t.Parallel()
 
 	scheme := runtime.NewScheme()
@@ -272,36 +274,30 @@ func TestTracker_IsLoaded_RankSuffixReconciliation(t *testing.T) {
 	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
 	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
 
-	// Poller-form key (plain pod name), as written by pollOnce.
-	tr.SetLoaded("openai/llama-server-wzl2c", []string{"gpt-oss-20b"})
+	// Poller seeds by pod IP (what pollOnce writes).
+	tr.SetLoaded("10.0.0.3", []string{"gpt-oss-20b"})
 
-	// Filter/loader-form key (framework rank suffix) must resolve to it.
-	if !tr.IsLoaded("openai/llama-server-wzl2c-rank-0", "gpt-oss-20b") {
-		t.Error("IsLoaded with -rank-0 key did not match plain poller key")
+	// Lookup by the same IP matches.
+	if !tr.IsLoaded("10.0.0.3", "gpt-oss-20b") {
+		t.Error("IsLoaded(pod IP) did not match the seeded IP key")
 	}
 
-	// A non-rank-suffixed key must still work unchanged.
-	if !tr.IsLoaded("openai/llama-server-wzl2c", "gpt-oss-20b") {
-		t.Error("IsLoaded with plain key regressed")
+	// Keys are exact-match: a NamespacedName (rank-suffixed or not) is a
+	// DIFFERENT key and must not match. The filter avoids this by keying
+	// on Address (the IP), not NamespacedName.
+	if tr.IsLoaded("openai/server3-rank-0", "gpt-oss-20b") {
+		t.Error("IsLoaded matched a NamespacedName key; keys must be exact pod IPs")
 	}
 
-	// MarkLoaded via the framework key must be visible to a plain lookup.
-	tr.MarkLoaded("openai/llama-server-k7dcf-rank-0", "gemma4-26b-a4b")
-	if !tr.IsLoaded("openai/llama-server-k7dcf", "gemma4-26b-a4b") {
-		t.Error("MarkLoaded(-rank-0) not visible to plain IsLoaded")
+	// MarkLoaded / MarkUnloaded operate on the same IP keyspace.
+	tr.MarkLoaded("10.0.0.5", "gemma4-26b-a4b")
+	if !tr.IsLoaded("10.0.0.5", "gemma4-26b-a4b") {
+		t.Error("MarkLoaded(pod IP) not visible to IsLoaded(pod IP)")
 	}
 
-	// MarkUnloaded via the framework key must clear the plain entry.
-	tr.MarkUnloaded("openai/llama-server-k7dcf-rank-0", "gemma4-26b-a4b")
-	if tr.IsLoaded("openai/llama-server-k7dcf", "gemma4-26b-a4b") {
-		t.Error("MarkUnloaded(-rank-0) did not clear plain entry")
-	}
-
-	// A literal "-rank-" with a non-numeric tail is NOT a rank suffix and
-	// must be preserved verbatim.
-	tr.SetLoaded("openai/weird-rank-x", []string{"m"})
-	if !tr.IsLoaded("openai/weird-rank-x", "m") {
-		t.Error("non-numeric -rank- suffix was wrongly stripped")
+	tr.MarkUnloaded("10.0.0.5", "gemma4-26b-a4b")
+	if tr.IsLoaded("10.0.0.5", "gemma4-26b-a4b") {
+		t.Error("MarkUnloaded(pod IP) did not clear the entry")
 	}
 }
 
@@ -512,15 +508,17 @@ func TestTracker_Poll_QueriesPodAndUpdates(t *testing.T) {
 
 	tr.Start(ctx)
 
-	// After Start returns, the initial poll has completed.
-	if !tr.IsLoaded("openai/llama-server-aaa", "gpt-oss-20b") {
+	// After Start returns, the initial poll has completed. The poller keys
+	// by pod IP (here `host`), matching how the filter/loader look up by
+	// the framework endpoint Address.
+	if !tr.IsLoaded(host, "gpt-oss-20b") {
 		t.Errorf(
-			"expected gpt-oss-20b loaded on llama-server-aaa, snapshot=%+v",
-			tr.Snapshot(),
+			"expected gpt-oss-20b loaded on pod IP %s, snapshot=%+v",
+			host, tr.Snapshot(),
 		)
 	}
 
-	if tr.IsLoaded("openai/llama-server-aaa", "configured-but-unloaded") {
+	if tr.IsLoaded(host, "configured-but-unloaded") {
 		t.Error("'unloaded' status should not be reported as loaded")
 	}
 
