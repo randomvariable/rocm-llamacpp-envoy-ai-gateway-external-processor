@@ -47,7 +47,13 @@ const (
 	defaultModelServerPort     = 8080
 	defaultModelLoadEndpoint   = "/models/load"
 	defaultModelQueryEndpoint  = "/models"
-	defaultModelLoadTimeout    = 60 * time.Second
+	// defaultModelLoadTimeout bounds how long PreRequest waits for a
+	// cold-load to actually complete (POST /models/load is async on
+	// llama-server, so we poll /v1/models until status is loaded).
+	// 15 min covers gpt-oss-20b MXFP4 (~30-90s typical) and is a
+	// safety margin for the slowest plausible cold-load on Strix
+	// Halo without leaving requests hanging forever on a hung server.
+	defaultModelLoadTimeout = 15 * time.Minute
 	defaultModelQueryTimeout   = 5 * time.Second
 	defaultConcurrentLoadLimit = 2
 
@@ -592,6 +598,20 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 		return fmt.Errorf("%w: status %d: %s", ErrModelLoadFailed, resp.StatusCode, string(respBody))
 	}
 
+	// llama-server's /models/load is async — it returns 200
+	// {"success":true} in milliseconds and the model transitions to
+	// status="loading" in /v1/models. We MUST wait for status to
+	// become "loaded" (or "running") before returning, otherwise
+	// PreRequest returns to the framework, Envoy forwards the chat
+	// request to the chosen pod, and llama-server 400s with
+	// "model is not loaded" because the load is still in progress.
+	// Critical when --no-models-autoload is set on llama-server (no
+	// safety net) — autoload would otherwise paper over the race.
+	waitErr := p.waitForModelLoaded(ctx, podIP, modelName)
+	if waitErr != nil {
+		return fmt.Errorf("wait for model %q to load on %s: %w", modelName, podIP, waitErr)
+	}
+
 	// Mark model as loaded.
 	p.mu.Lock()
 	p.loadedModels[loadKey] = time.Now()
@@ -600,4 +620,51 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	klog.Infof("ModelLoader.loadModel: successfully loaded model %q on pod %s", modelName, podIP)
 
 	return nil
+}
+
+// waitForModelLoaded polls /v1/models on podIP until modelName's
+// status is "loaded"/"running"/"" or the context's load timeout
+// elapses. Uses a short fixed poll interval (1s) because cold-loads
+// can complete anywhere between a few seconds (small Q4 models) and
+// many minutes (large MoE on Strix Halo). Returns nil on success;
+// wraps the deadline error otherwise.
+func (p *Plugin) waitForModelLoaded(ctx context.Context, podIP, modelName string) error {
+	// Bound by ModelLoadTimeout (configured separately from PreRequest
+	// context to allow long cold-loads to outlive a single request's
+	// deadline if needed).
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(p.config.ModelLoadTimeoutSeconds)*time.Second)
+	defer cancel()
+
+	const pollInterval = 1 * time.Second
+
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	klog.Infof(
+		"ModelLoader.waitForModelLoaded: waiting for %q on %s (timeout=%s)",
+		modelName, podIP, time.Duration(p.config.ModelLoadTimeoutSeconds)*time.Second,
+	)
+
+	// First-check before the first tick — useful for warm hits where
+	// /models/load was a no-op and the model is already serving.
+	if p.isModelLoaded(waitCtx, podIP, modelName) {
+		return nil
+	}
+
+	for {
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("timed out waiting for %q to load on %s: %w",
+				modelName, podIP, waitCtx.Err())
+		case <-ticker.C:
+			if p.isModelLoaded(waitCtx, podIP, modelName) {
+				klog.Infof(
+					"ModelLoader.waitForModelLoaded: %q now loaded on %s",
+					modelName, podIP,
+				)
+
+				return nil
+			}
+		}
+	}
 }
