@@ -28,6 +28,7 @@ import (
 	"sigs.k8s.io/gateway-api-inference-extension/pkg/epp/scheduling/types"
 
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/modeltracker"
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/podstate"
 )
 
 const (
@@ -62,12 +63,18 @@ var _ framework.Filter = &LoadedModelFilter{}
 type LoadedModelFilter struct {
 	typedName plugins.TypedName
 	tracker   *modeltracker.Tracker
+	// podState is an optional shared cache the filter populates from the
+	// framework's per-pod metrics so that other components (notably the
+	// modeltracker's dedup logic) can read pressure data without having
+	// to re-implement the framework's metric refresher. May be nil.
+	podState *podstate.Cache
 }
 
 // LoadedModelFilterDeps holds the dependencies for the filter.
 // Injected at startup before plugin registration.
 type LoadedModelFilterDeps struct {
-	Tracker *modeltracker.Tracker
+	Tracker  *modeltracker.Tracker
+	PodState *podstate.Cache
 }
 
 // Global deps - set before plugin registration.
@@ -89,7 +96,9 @@ func LoadedModelFilterFactory(
 		return nil, ErrDepsNotSet
 	}
 
-	return NewLoadedModelFilter(filterDeps.Tracker).WithName(name), nil
+	return NewLoadedModelFilter(filterDeps.Tracker).
+		WithPodState(filterDeps.PodState).
+		WithName(name), nil
 }
 
 // NewLoadedModelFilter constructs a filter bound to a tracker.
@@ -98,6 +107,14 @@ func NewLoadedModelFilter(tracker *modeltracker.Tracker) *LoadedModelFilter {
 		typedName: plugins.TypedName{Type: LoadedModelFilterType},
 		tracker:   tracker,
 	}
+}
+
+// WithPodState binds a shared pod-state cache the filter will populate
+// from per-pod metrics during Filter calls. nil disables population.
+func (f *LoadedModelFilter) WithPodState(cache *podstate.Cache) *LoadedModelFilter {
+	f.podState = cache
+
+	return f
 }
 
 // WithName sets the plugin instance name.
@@ -147,6 +164,22 @@ func (f *LoadedModelFilter) Filter(
 		}
 
 		key := info.NamespacedName.String()
+
+		// Side effect: feed the shared pod-state cache so the
+		// modeltracker can score winners during dedup. Cheap copy of
+		// numeric fields; no allocations on the hot path beyond the
+		// map write inside the cache itself.
+		if f.podState != nil {
+			if m := pod.GetMetrics(); m != nil {
+				f.podState.Update(podstate.Snapshot{
+					PodKey:              key,
+					RunningRequestsSize: m.RunningRequestsSize,
+					WaitingQueueSize:    m.WaitingQueueSize,
+					KVCacheUsagePercent: m.KVCacheUsagePercent,
+				})
+			}
+		}
+
 		if f.tracker.IsLoaded(key, model) {
 			warm = append(warm, pod)
 		}

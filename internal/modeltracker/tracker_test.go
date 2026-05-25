@@ -549,3 +549,379 @@ func splitHostPort(hostport string) (host, port string, err error) {
 // Reference (kept compiled to avoid dead-code lint) so a future refactor
 // to multi-pod test servers has a starting point.
 var _ = newTrackerWithFakeServers
+
+// fakePressure is a deterministic PressureProvider for dedup tests.
+type fakePressure struct {
+	scores map[string]float64
+}
+
+func (f fakePressure) Pressure(podKey string) float64 {
+	return f.scores[podKey]
+}
+
+// fakeUnloadServer responds to GET /models with the configured set and
+// records POST /models/unload bodies for later assertion.
+type fakeUnloadServer struct {
+	mu       sync.Mutex
+	models   []string
+	unloaded []string // model IDs the server received unload requests for
+}
+
+func (s *fakeUnloadServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodGet && r.URL.Path == "/models" {
+		s.mu.Lock()
+		ms := append([]string{}, s.models...)
+		s.mu.Unlock()
+
+		type entry struct {
+			ID     string            `json:"id"`
+			Status map[string]string `json:"status"`
+		}
+
+		out := make([]entry, 0, len(ms))
+		for _, m := range ms {
+			out = append(out, entry{ID: m, Status: map[string]string{"value": "loaded"}})
+		}
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": out})
+
+		return
+	}
+
+	if r.Method == http.MethodPost && r.URL.Path == "/models/unload" {
+		var body struct {
+			Model string `json:"model"`
+		}
+
+		_ = json.NewDecoder(r.Body).Decode(&body)
+
+		s.mu.Lock()
+		s.unloaded = append(s.unloaded, body.Model)
+		s.mu.Unlock()
+
+		_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+
+		return
+	}
+
+	http.NotFound(w, r)
+}
+
+func (s *fakeUnloadServer) unloadedCalls() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := append([]string{}, s.unloaded...)
+
+	return out
+}
+
+// trackerForDedup returns a tracker plus per-pod fake servers for use
+// in dedup tests. Each pod gets its own httptest server so unload calls
+// land on the right pod.
+func trackerForDedup(
+	t *testing.T,
+	pods map[string][]string, // podKey "ns/name" -> loaded models
+	pressure modeltracker.PressureProvider,
+	dedupGracePolls int,
+) (*modeltracker.Tracker, map[string]*fakeUnloadServer) {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	servers := make(map[string]*fakeUnloadServer, len(pods))
+
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{
+		Namespace:       "openai",
+		Pressure:        pressure,
+		DedupGracePolls: dedupGracePolls,
+		// Default PodPort=8080. We override per-pod via per-tracker
+		// servers below by using each test server's port.
+	})
+
+	// All test servers share httptest's 127.0.0.1, but each binds a
+	// distinct random port. The tracker has only one podPort, so we
+	// also need per-pod IP→port routing in the URL. The simplest
+	// path: replace the tracker's httpClient with one whose Transport
+	// rewrites Host to point at the right test server based on the
+	// requested host:port. But we can't do that without exposing
+	// internals. Pragmatic alternative: bind each test server to the
+	// same loopback addr+port via a single Mux, keyed on a Host
+	// header we set... also requires internals.
+	//
+	// Simplest working approach: per-pod single-port server, set
+	// Tracker.podPort = first server port, and add a SetPodIP that
+	// records the literal "host:port" string as the "IP". Then in
+	// unloadModel the URL becomes
+	// http://<host:port>:<podPort>/models/unload which is wrong.
+	//
+	// Cleanest: each pod's IP IS the unique host+port string ONLY
+	// when we set podPort=0 in the URL builder... but tracker forces
+	// a port.
+	//
+	// Decision: use a single shared httptest server. Encode the
+	// "pod" in the URL path via a custom mux that strips the prefix.
+	// To do that the tracker would need a per-pod unloadPath, which
+	// we don't have. So instead use a single server and let all
+	// "pods" point at it — that means we can't tell which pod the
+	// unload was sent to except by observing call order under our
+	// deterministic winner selection (lowest pressure first, alpha
+	// tiebreak). That's what the dedup tests assert anyway.
+
+	shared := &fakeUnloadServer{}
+	srv := httptest.NewServer(shared)
+
+	t.Cleanup(srv.Close)
+
+	u, _ := url.Parse(srv.URL)
+	host, portStr, _ := splitHostPort(u.Host)
+	port, _ := strconv.Atoi(portStr)
+
+	// Trick: point all pods at the same loopback host but with a
+	// distinct "synthetic" IP each. The tracker builds the URL as
+	// http://<IP>:<podPort>/models/unload. We can override the IP to
+	// the literal "127.0.0.1" and the podPort to the shared test
+	// server port, so every pod's request lands on the same server.
+	// The shared server records the model name (which is what dedup
+	// uses to pick the loser), so per-pod IP routing isn't required
+	// for the assertions below.
+	_ = host
+
+	// Re-construct tracker with the right podPort. Since NewTracker
+	// applies defaults at construction time and we already built one
+	// above, we discard it and build again.
+	tr = modeltracker.NewTracker(cli, modeltracker.Options{
+		Namespace:       "openai",
+		PodPort:         port,
+		Pressure:        pressure,
+		DedupGracePolls: dedupGracePolls,
+	})
+
+	for podKey, models := range pods {
+		tr.SetLoaded(podKey, models)
+		tr.SetPodIP(podKey, "127.0.0.1")
+
+		servers[podKey] = shared
+	}
+
+	return tr, servers
+}
+
+func TestTracker_ResolveDuplicates_NoPressureProvider_NoUnload(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	tr.SetLoaded("openai/a", []string{"gpt-oss-20b"})
+	tr.SetLoaded("openai/b", []string{"gpt-oss-20b"})
+
+	// Without a Pressure provider, dedup MUST be a no-op even after
+	// many polls — feature is opt-in via Options.Pressure.
+	for i := 0; i < 10; i++ {
+		tr.ResolveDuplicates(context.Background())
+	}
+
+	if !tr.IsLoaded("openai/a", "gpt-oss-20b") || !tr.IsLoaded("openai/b", "gpt-oss-20b") {
+		t.Error("dedup ran without a pressure provider")
+	}
+}
+
+func TestTracker_ResolveDuplicates_GraceWindow(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 5,
+		"openai/b": 1, // lower → loser
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"gpt-oss-20b"},
+		"openai/b": {"gpt-oss-20b"},
+	}, pressure, 3)
+
+	// First two observations: duplicate detected but within grace.
+	tr.ResolveDuplicates(context.Background())
+	tr.ResolveDuplicates(context.Background())
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 0 {
+		t.Errorf("expected no unload during grace, got %d", got)
+	}
+
+	// Third observation crosses the threshold → one unload.
+	tr.ResolveDuplicates(context.Background())
+
+	calls := srv["openai/a"].unloadedCalls()
+	if len(calls) != 1 || calls[0] != "gpt-oss-20b" {
+		t.Errorf("expected one gpt-oss-20b unload after grace, got %+v", calls)
+	}
+
+	if tr.IsLoaded("openai/b", "gpt-oss-20b") {
+		t.Error("expected gpt-oss-20b unloaded from openai/b (lower pressure)")
+	}
+
+	if !tr.IsLoaded("openai/a", "gpt-oss-20b") {
+		t.Error("expected gpt-oss-20b still loaded on openai/a (winner)")
+	}
+}
+
+func TestTracker_ResolveDuplicates_WinnerByPressure(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 1,
+		"openai/b": 10, // highest → winner
+		"openai/c": 5,
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"shared-model"},
+		"openai/b": {"shared-model"},
+		"openai/c": {"shared-model"},
+	}, pressure, 1)
+
+	tr.ResolveDuplicates(context.Background())
+
+	// 1 unload per cycle by default. The lowest-pressure pod (a) loses.
+	if len(srv["openai/a"].unloadedCalls()) != 1 {
+		t.Errorf("expected 1 unload call, got %d", len(srv["openai/a"].unloadedCalls()))
+	}
+
+	if tr.IsLoaded("openai/a", "shared-model") {
+		t.Error("openai/a was lowest pressure, expected it to lose")
+	}
+
+	if !tr.IsLoaded("openai/b", "shared-model") || !tr.IsLoaded("openai/c", "shared-model") {
+		t.Error("expected winners (b, c) to keep the model")
+	}
+}
+
+func TestTracker_ResolveDuplicates_AlphaTiebreakWhenAllScoresEqual(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 0,
+		"openai/b": 0,
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"m"},
+		"openai/b": {"m"},
+	}, pressure, 1)
+
+	tr.ResolveDuplicates(context.Background())
+
+	// With all-zero pressure, pickLoser picks the alphabetically-first
+	// pod (openai/a) as the seed loser and never sees a strictly
+	// lower score, so a stays the loser.
+	if tr.IsLoaded("openai/a", "m") {
+		t.Error("expected openai/a to lose tiebreak")
+	}
+
+	if !tr.IsLoaded("openai/b", "m") {
+		t.Error("expected openai/b to win tiebreak")
+	}
+
+	if len(srv["openai/a"].unloadedCalls()) != 1 {
+		t.Errorf("expected exactly 1 unload, got %d", len(srv["openai/a"].unloadedCalls()))
+	}
+}
+
+func TestTracker_ResolveDuplicates_ThrottledTo1PerCycle(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 5,
+		"openai/b": 1, // loser
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"model-1", "model-2", "model-3"},
+		"openai/b": {"model-1", "model-2", "model-3"},
+	}, pressure, 1)
+
+	tr.ResolveDuplicates(context.Background())
+
+	// 3 duplicates, but the per-cycle throttle caps us at 1 unload.
+	if got := len(srv["openai/a"].unloadedCalls()); got != 1 {
+		t.Errorf("expected 1 unload per cycle, got %d", got)
+	}
+
+	// Two duplicates still pending; next cycle handles one more.
+	tr.ResolveDuplicates(context.Background())
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 2 {
+		t.Errorf("expected 2 cumulative unloads after 2 cycles, got %d", got)
+	}
+}
+
+func TestTracker_ResolveDuplicates_ResolvedDuplicateClearsObservations(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 5,
+		"openai/b": 1,
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"gpt-oss-20b"},
+		"openai/b": {"gpt-oss-20b"},
+	}, pressure, 3)
+
+	// Observe twice (under grace).
+	tr.ResolveDuplicates(context.Background())
+	tr.ResolveDuplicates(context.Background())
+
+	// Now the duplicate resolves naturally (pod b restarted, lost the
+	// model). The dedup pass should drop the observation counter.
+	tr.MarkUnloaded("openai/b", "gpt-oss-20b")
+	tr.ResolveDuplicates(context.Background())
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 0 {
+		t.Errorf("dedup acted after duplicate resolved on its own: %d calls", got)
+	}
+
+	// Re-create the duplicate and verify the observation counter
+	// restarts at 0 (must observe 3 fresh polls again, not 1).
+	tr.MarkLoaded("openai/b", "gpt-oss-20b")
+	tr.ResolveDuplicates(context.Background()) // obs=1
+	tr.ResolveDuplicates(context.Background()) // obs=2
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 0 {
+		t.Errorf("dedup didn't restart grace counter, %d unloads", got)
+	}
+
+	tr.ResolveDuplicates(context.Background()) // obs=3, fires
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 1 {
+		t.Errorf("expected 1 unload after fresh 3-poll grace, got %d", got)
+	}
+}
+
+func TestTracker_ResolveDuplicates_SingleHolderSkipped(t *testing.T) {
+	t.Parallel()
+
+	pressure := fakePressure{scores: map[string]float64{
+		"openai/a": 5,
+	}}
+
+	tr, srv := trackerForDedup(t, map[string][]string{
+		"openai/a": {"gpt-oss-20b"},
+	}, pressure, 1)
+
+	tr.ResolveDuplicates(context.Background())
+
+	if got := len(srv["openai/a"].unloadedCalls()); got != 0 {
+		t.Errorf("non-duplicate triggered unload: %d calls", got)
+	}
+
+	if !tr.IsLoaded("openai/a", "gpt-oss-20b") {
+		t.Error("the only copy was unloaded — would have stranded all traffic")
+	}
+}

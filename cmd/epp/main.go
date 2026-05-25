@@ -41,6 +41,7 @@ import (
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/filter"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/modelloader"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/plugins/scorer"
+	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/podstate"
 	pkgversion "github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/version"
 	"github.com/randomvariable/rocm-llamacpp-envoy-ai-gateway-external-processor/internal/vram"
 )
@@ -77,8 +78,16 @@ func main() {
 	// Start VRAM tracker.
 	tracker := startVRAMTracker(ctx, k8sClient)
 
+	// Shared per-pod load-signal cache. The loaded-model filter writes
+	// into it on each Filter call (from the framework's PodMetrics);
+	// the modeltracker reads from it when picking a winner during
+	// duplicate-model dedup. Without this cache the two components
+	// can't share pressure data because the framework's Datastore is
+	// only exposed inside the request-scheduling pipeline.
+	loadCache := podstate.NewCache()
+
 	// Start loaded-model tracker (polls /models on each llama-server pod).
-	mTracker := startModelTracker(ctx, k8sClient)
+	mTracker := startModelTracker(ctx, k8sClient, loadCache)
 
 	// Set up dependencies for VRAM scorer plugin.
 	scorer.SetVRAMScorerDeps(&scorer.VRAMScorerDeps{
@@ -88,7 +97,8 @@ func main() {
 
 	// Set up dependencies for loaded-model filter plugin.
 	filter.SetLoadedModelFilterDeps(&filter.LoadedModelFilterDeps{
-		Tracker: mTracker,
+		Tracker:  mTracker,
+		PodState: loadCache,
 	})
 
 	// Set up dependencies for model-loader plugin. Sharing the tracker
@@ -133,7 +143,11 @@ func initConfig() {
 	viper.AutomaticEnv()
 }
 
-func startModelTracker(ctx context.Context, k8sClient crclient.Client) *modeltracker.Tracker {
+func startModelTracker(
+	ctx context.Context,
+	k8sClient crclient.Client,
+	pressure modeltracker.PressureProvider,
+) *modeltracker.Tracker {
 	namespace := viper.GetString("namespace")
 	podSelector := viper.GetStringMapString("pod-selector")
 	pollInterval := viper.GetDuration("model-poll-interval")
@@ -150,6 +164,7 @@ func startModelTracker(ctx context.Context, k8sClient crclient.Client) *modeltra
 		PodPort:      port,
 		QueryPath:    queryPath,
 		PollInterval: pollInterval,
+		Pressure:     pressure,
 	})
 
 	go t.Start(ctx)

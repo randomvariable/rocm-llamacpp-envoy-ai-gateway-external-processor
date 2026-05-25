@@ -26,6 +26,7 @@
 package modeltracker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -33,6 +34,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -59,6 +61,22 @@ const (
 	// (The "/v1/" prefix variant is the same; llama-server accepts both.)
 	DefaultModelQueryPath = "/models"
 
+	// DefaultUnloadPath is llama-server's router-mode unload endpoint.
+	// POST {"model": "<id>"} → {"success": true}.
+	DefaultUnloadPath = "/models/unload"
+
+	// DefaultDedupGracePolls is how many consecutive polls a duplicate
+	// must be observed for before we act. At the default 10s poll, this
+	// works out to ~30s, enough for transient races (concurrent cold-
+	// load on two pods that both win the modelloader's MarkLoaded
+	// in the same window) to drain naturally.
+	DefaultDedupGracePolls = 3
+
+	// MaxUnloadsPerCycle bounds how many duplicate-evictions we issue
+	// per poll cycle to avoid simultaneous reclaim across many models
+	// thrashing the affected pod.
+	MaxUnloadsPerCycle = 1
+
 	// logVerbosity is the klog verbosity level for debug messages.
 	logVerbosity = 2
 )
@@ -82,6 +100,13 @@ type modelResponse struct {
 // PodModelSet is the per-pod set of currently loaded model IDs.
 type PodModelSet = map[string]struct{}
 
+// PressureProvider returns a per-pod load score used to pick which copy
+// of a duplicated model to keep during dedup. Higher = more loaded =
+// keep the model here. Returning 0 for unknown pods is fine.
+type PressureProvider interface {
+	Pressure(podKey string) float64
+}
+
 // Tracker periodically scans llama-server pods and records which models
 // are currently loaded on each.
 type Tracker struct {
@@ -91,11 +116,20 @@ type Tracker struct {
 	podSelector  map[string]string
 	podPort      int
 	queryPath    string
+	unloadPath   string
 	pollInterval time.Duration
 
-	mu        sync.RWMutex
-	loaded    map[string]PodModelSet // podKey "namespace/name" -> loaded model IDs
-	firstPoll bool                   // true once an initial poll has run
+	pressure        PressureProvider
+	dedupGracePolls int
+
+	mu      sync.RWMutex
+	loaded  map[string]PodModelSet // podKey "namespace/name" -> loaded model IDs
+	podIP   map[string]string      // podKey -> pod IP, refreshed each poll
+	// dupObs counts how many consecutive polls a model has appeared on
+	// ≥2 pods. Reset to 0 on either dedup action or on the model
+	// returning to a single pod naturally.
+	dupObs    map[string]int
+	firstPoll bool // true once an initial poll has run
 }
 
 // Options configures a Tracker. All fields have sensible defaults.
@@ -108,11 +142,19 @@ type Options struct {
 	PodPort int
 	// QueryPath is the model-listing endpoint (default "/models").
 	QueryPath string
+	// UnloadPath is the router-mode unload endpoint (default "/models/unload").
+	UnloadPath string
 	// PollInterval is how often each pod is queried (default 10s).
 	PollInterval time.Duration
 	// PollTimeout bounds each HTTP call (default 5s). Lower than the
 	// poll interval so a hung pod can't block the cycle.
 	PollTimeout time.Duration
+	// Pressure scores pods for dedup winner selection. nil disables
+	// dedup entirely (the tracker still observes duplicates but never
+	// triggers an unload — useful for unit tests).
+	Pressure PressureProvider
+	// DedupGracePolls overrides DefaultDedupGracePolls. 0 = default.
+	DedupGracePolls int
 }
 
 // NewTracker constructs a Tracker. Caller invokes Start to begin polling.
@@ -133,15 +175,28 @@ func NewTracker(client crclient.Client, opts Options) *Tracker {
 		opts.PollTimeout = DefaultPollTimeout
 	}
 
+	if opts.UnloadPath == "" {
+		opts.UnloadPath = DefaultUnloadPath
+	}
+
+	if opts.DedupGracePolls == 0 {
+		opts.DedupGracePolls = DefaultDedupGracePolls
+	}
+
 	return &Tracker{
-		client:       client,
-		httpClient:   &http.Client{Timeout: opts.PollTimeout},
-		namespace:    opts.Namespace,
-		podSelector:  opts.PodSelector,
-		podPort:      opts.PodPort,
-		queryPath:    opts.QueryPath,
-		pollInterval: opts.PollInterval,
-		loaded:       make(map[string]PodModelSet),
+		client:          client,
+		httpClient:      &http.Client{Timeout: opts.PollTimeout},
+		namespace:       opts.Namespace,
+		podSelector:     opts.PodSelector,
+		podPort:         opts.PodPort,
+		queryPath:       opts.QueryPath,
+		unloadPath:      opts.UnloadPath,
+		pollInterval:    opts.PollInterval,
+		pressure:        opts.Pressure,
+		dedupGracePolls: opts.DedupGracePolls,
+		loaded:          make(map[string]PodModelSet),
+		podIP:           make(map[string]string),
+		dupObs:          make(map[string]int),
 	}
 }
 
@@ -244,6 +299,26 @@ func (t *Tracker) SetLoaded(podKey string, models []string) {
 	t.firstPoll = true
 }
 
+// SetPodIP is exposed for tests to seed the pod→IP map used by dedup
+// to route the unload HTTP call.
+func (t *Tracker) SetPodIP(podKey, ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if t.podIP == nil {
+		t.podIP = make(map[string]string)
+	}
+
+	t.podIP[podKey] = ip
+}
+
+// ResolveDuplicates is the public entry point to the dedup pass.
+// Production code calls it once per poll cycle from pollOnce; tests
+// call it directly after seeding state.
+func (t *Tracker) ResolveDuplicates(ctx context.Context) {
+	t.resolveDuplicates(ctx)
+}
+
 // MarkLoaded marks `model` as loaded on `podKey` immediately, without
 // waiting for the next poll. The next poll will overwrite this state
 // with the actual /v1/models response. This is the proactive in-band
@@ -303,11 +378,16 @@ func (t *Tracker) pollOnce(ctx context.Context) {
 	}
 
 	next := make(map[string]PodModelSet, len(pods))
+	nextIPs := make(map[string]string, len(pods))
+
 	for i := range pods {
 		pod := &pods[i]
 		if pod.Status.PodIP == "" {
 			continue
 		}
+
+		key := podKey(pod)
+		nextIPs[key] = pod.Status.PodIP
 
 		set, qErr := t.queryPod(ctx, pod.Status.PodIP)
 		if qErr != nil {
@@ -319,27 +399,30 @@ func (t *Tracker) pollOnce(ctx context.Context) {
 			// Preserve last-known state on transient failure so a flaky
 			// pod doesn't get all its routing dropped mid-cycle.
 			t.mu.RLock()
-			prev, ok := t.loaded[podKey(pod)]
+			prev, ok := t.loaded[key]
 			t.mu.RUnlock()
 
 			if ok {
-				next[podKey(pod)] = prev
+				next[key] = prev
 			}
 
 			continue
 		}
 
-		next[podKey(pod)] = set
+		next[key] = set
 	}
 
 	t.mu.Lock()
 	t.loaded = next
+	t.podIP = nextIPs
 	t.firstPoll = true
 	t.mu.Unlock()
 
 	klog.V(logVerbosity).Infof(
 		"modeltracker: poll complete, tracking %d pods", len(next),
 	)
+
+	t.resolveDuplicates(ctx)
 }
 
 func (t *Tracker) listPods(ctx context.Context) ([]corev1.Pod, error) {
@@ -427,4 +510,237 @@ func (t *Tracker) queryPod(
 
 func podKey(p *corev1.Pod) string {
 	return p.Namespace + "/" + p.Name
+}
+
+// resolveDuplicates inspects the just-updated loaded map for models
+// present on ≥2 pods and, after a grace period of consecutive
+// observations, unloads the model from the lowest-pressure pod.
+//
+// At most MaxUnloadsPerCycle unloads are issued per call to avoid
+// reclaim stampedes. Observations are tracked per model: a single
+// dedup action satisfies the contract for one model per cycle but
+// other models with mature observations get their turn on subsequent
+// polls.
+//
+// Skips entirely when:
+//   - dedup is disabled (no pressure provider configured)
+//   - no model appears on more than one pod
+//   - the only candidate pod is one whose pressure score is unknown
+//     AND there is no deterministic tiebreak available
+//
+// Safety: only ever unloads from a pod when at least one *other* pod
+// still has the model loaded — the dedup criterion itself guarantees
+// this (a model isn't a duplicate unless ≥2 pods have it). Combined
+// with MarkUnloaded on success, the in-memory view converges before
+// the next poll.
+func (t *Tracker) resolveDuplicates(ctx context.Context) {
+	if t.pressure == nil {
+		return
+	}
+
+	// Snapshot under read lock; modifications happen via MarkUnloaded.
+	t.mu.RLock()
+
+	if !t.firstPoll {
+		t.mu.RUnlock()
+
+		return
+	}
+
+	// model -> pods that currently have it loaded.
+	dup := make(map[string][]string)
+	for pk, set := range t.loaded {
+		for model := range set {
+			dup[model] = append(dup[model], pk)
+		}
+	}
+
+	// Snapshot the IP map so unloads outside the lock have a stable
+	// view even if the next poll runs concurrently.
+	ipSnap := make(map[string]string, len(t.podIP))
+	for k, v := range t.podIP {
+		ipSnap[k] = v
+	}
+	t.mu.RUnlock()
+
+	// Phase 1: update observation counters; collect ripe duplicates.
+	t.mu.Lock()
+
+	type ripe struct {
+		model string
+		holders []string
+	}
+
+	var ripeList []ripe
+
+	resolvedModels := make([]string, 0)
+
+	for model := range t.dupObs {
+		// If a previously-observed duplicate has resolved on its own
+		// (one pod evicted, k8s rolled, etc.), drop the counter.
+		if len(dup[model]) < 2 {
+			resolvedModels = append(resolvedModels, model)
+		}
+	}
+
+	for _, m := range resolvedModels {
+		delete(t.dupObs, m)
+	}
+
+	for model, holders := range dup {
+		if len(holders) < 2 {
+			continue
+		}
+
+		t.dupObs[model]++
+
+		if t.dupObs[model] >= t.dedupGracePolls {
+			ripeList = append(ripeList, ripe{model: model, holders: holders})
+		}
+	}
+	t.mu.Unlock()
+
+	if len(ripeList) == 0 {
+		return
+	}
+
+	// Deterministic ordering across cycles so the per-cycle throttle
+	// doesn't starve any one model when several are ripe.
+	sort.Slice(ripeList, func(i, j int) bool {
+		return ripeList[i].model < ripeList[j].model
+	})
+
+	issued := 0
+	for _, r := range ripeList {
+		if issued >= MaxUnloadsPerCycle {
+			break
+		}
+
+		loserKey := t.pickLoser(r.holders)
+		if loserKey == "" {
+			continue
+		}
+
+		loserIP, ok := ipSnap[loserKey]
+		if !ok || loserIP == "" {
+			klog.V(logVerbosity).Infof(
+				"modeltracker: dedup skip %q on %s: no IP",
+				r.model, loserKey,
+			)
+
+			continue
+		}
+
+		uErr := t.unloadModel(ctx, loserIP, r.model)
+		if uErr != nil {
+			klog.Errorf(
+				"modeltracker: dedup unload %q on %s (%s) failed: %v",
+				r.model, loserKey, loserIP, uErr,
+			)
+
+			continue
+		}
+
+		t.MarkUnloaded(loserKey, r.model)
+
+		t.mu.Lock()
+		delete(t.dupObs, r.model)
+		t.mu.Unlock()
+
+		klog.Infof(
+			"modeltracker: dedup unloaded %q from %s (held by %d pods)",
+			r.model, loserKey, len(r.holders),
+		)
+
+		issued++
+	}
+}
+
+// pickLoser returns the pod from `holders` with the lowest pressure
+// score; ties broken by alphabetical podKey for determinism. Returns
+// "" when holders is empty.
+func (t *Tracker) pickLoser(holders []string) string {
+	if len(holders) == 0 {
+		return ""
+	}
+
+	// Stable order before scoring so tiebreak is deterministic.
+	sorted := make([]string, len(holders))
+	copy(sorted, holders)
+	sort.Strings(sorted)
+
+	loser := sorted[0]
+	loserScore := t.pressure.Pressure(loser)
+
+	for _, pk := range sorted[1:] {
+		s := t.pressure.Pressure(pk)
+		if s < loserScore {
+			loser = pk
+			loserScore = s
+		}
+	}
+
+	return loser
+}
+
+// unloadModel sends POST /models/unload {"model": "<id>"} to podIP.
+// Returns nil on HTTP 200 with {"success": true}; error otherwise.
+func (t *Tracker) unloadModel(
+	ctx context.Context, podIP, model string,
+) error {
+	url := "http://" + net.JoinHostPort(
+		podIP, strconv.Itoa(t.podPort),
+	) + t.unloadPath
+
+	body, err := json.Marshal(map[string]string{"model": model})
+	if err != nil {
+		return fmt.Errorf("marshal body: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(
+		ctx, http.MethodPost, url, bytes.NewReader(body),
+	)
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("do request: %w", err)
+	}
+
+	defer func() {
+		closeErr := resp.Body.Close()
+		if closeErr != nil {
+			klog.V(logVerbosity).Infof(
+				"modeltracker: unload close body: %v", closeErr,
+			)
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unload %s: status %d", model, resp.StatusCode)
+	}
+
+	var parsed struct {
+		Success bool `json:"success"`
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read body: %w", err)
+	}
+
+	jErr := json.Unmarshal(respBody, &parsed)
+	if jErr != nil {
+		return fmt.Errorf("decode body: %w", jErr)
+	}
+
+	if !parsed.Success {
+		return fmt.Errorf("unload %s: server reported success=false", model)
+	}
+
+	return nil
 }
