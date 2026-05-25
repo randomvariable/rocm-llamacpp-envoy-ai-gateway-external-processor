@@ -36,6 +36,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -244,6 +245,10 @@ func (t *Tracker) IsLoaded(podKey, model string) bool {
 		return false
 	}
 
+	// Scheduling-path callers pass the framework's "<name>-rank-<idx>"
+	// form; the poller stores the plain pod name. Reconcile here.
+	podKey = normalizeKey(podKey)
+
 	set, ok := t.loaded[podKey]
 	if !ok {
 		return false
@@ -342,6 +347,10 @@ func (t *Tracker) MarkLoaded(podKey, model string) {
 		return
 	}
 
+	// Align the modelloader's framework "<name>-rank-<idx>" key with the
+	// poller's plain pod-name keyspace so IsLoaded can find this mark.
+	podKey = normalizeKey(podKey)
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -363,6 +372,9 @@ func (t *Tracker) MarkUnloaded(podKey, model string) {
 	if podKey == "" || model == "" {
 		return
 	}
+
+	// Match the keyspace used by MarkLoaded / IsLoaded / the poller.
+	podKey = normalizeKey(podKey)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -518,6 +530,44 @@ func (t *Tracker) queryPod(
 
 func podKey(p *corev1.Pod) string {
 	return p.Namespace + "/" + p.Name
+}
+
+// normalizeKey strips a trailing "-rank-<N>" suffix from a pod key.
+//
+// The gateway-api-inference-extension datastore (v1.3.0+) addresses every
+// InferencePool endpoint as "<namespace>/<podname>-rank-<idx>" (idx=0 for
+// single-host pods; see datastore.go AddOrUpdatePod which builds
+// `pod.Name + "-rank-" + strconv.Itoa(idx)`). Scheduling-path callers
+// (the loaded-model filter and the modelloader) therefore pass keys WITH
+// the rank suffix.
+//
+// The loaded-model poller, by contrast, lists raw Pods and keys them as
+// "<namespace>/<podname>" (see podKey). Without reconciling the two forms,
+// IsLoaded never matches the poller's entries, the filter sees zero warm
+// pods, and every request falls through to a cold-load on all pods — the
+// exact failure the filter exists to prevent.
+//
+// Each llama-server is a single-host pod with a unique base name, so
+// collapsing the rank index back to the pod is safe and pod-granular,
+// matching how the tracker polls /models (one process per pod).
+func normalizeKey(podKey string) string {
+	i := strings.LastIndex(podKey, "-rank-")
+	if i < 0 {
+		return podKey
+	}
+
+	suffix := podKey[i+len("-rank-"):]
+	if suffix == "" {
+		return podKey
+	}
+
+	for _, r := range suffix {
+		if r < '0' || r > '9' {
+			return podKey
+		}
+	}
+
+	return podKey[:i]
 }
 
 // resolveDuplicates inspects the just-updated loaded map for models

@@ -256,6 +256,55 @@ func TestTracker_IsLoaded_seededState(t *testing.T) {
 	}
 }
 
+// TestTracker_IsLoaded_RankSuffixReconciliation guards the v1.3.0
+// framework regression: the poller keys pods as "<ns>/<name>" while the
+// gateway-api-inference-extension datastore addresses them as
+// "<ns>/<name>-rank-<idx>". IsLoaded/MarkLoaded/MarkUnloaded must
+// reconcile the rank-suffixed scheduling-path keys against the poller's
+// plain keys, or the loaded-model filter sees zero warm pods and every
+// request cold-loads on all pods.
+func TestTracker_IsLoaded_RankSuffixReconciliation(t *testing.T) {
+	t.Parallel()
+
+	scheme := runtime.NewScheme()
+	_ = clientgoscheme.AddToScheme(scheme)
+
+	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	tr := modeltracker.NewTracker(cli, modeltracker.Options{})
+
+	// Poller-form key (plain pod name), as written by pollOnce.
+	tr.SetLoaded("openai/llama-server-wzl2c", []string{"gpt-oss-20b"})
+
+	// Filter/loader-form key (framework rank suffix) must resolve to it.
+	if !tr.IsLoaded("openai/llama-server-wzl2c-rank-0", "gpt-oss-20b") {
+		t.Error("IsLoaded with -rank-0 key did not match plain poller key")
+	}
+
+	// A non-rank-suffixed key must still work unchanged.
+	if !tr.IsLoaded("openai/llama-server-wzl2c", "gpt-oss-20b") {
+		t.Error("IsLoaded with plain key regressed")
+	}
+
+	// MarkLoaded via the framework key must be visible to a plain lookup.
+	tr.MarkLoaded("openai/llama-server-k7dcf-rank-0", "gemma4-26b-a4b")
+	if !tr.IsLoaded("openai/llama-server-k7dcf", "gemma4-26b-a4b") {
+		t.Error("MarkLoaded(-rank-0) not visible to plain IsLoaded")
+	}
+
+	// MarkUnloaded via the framework key must clear the plain entry.
+	tr.MarkUnloaded("openai/llama-server-k7dcf-rank-0", "gemma4-26b-a4b")
+	if tr.IsLoaded("openai/llama-server-k7dcf", "gemma4-26b-a4b") {
+		t.Error("MarkUnloaded(-rank-0) did not clear plain entry")
+	}
+
+	// A literal "-rank-" with a non-numeric tail is NOT a rank suffix and
+	// must be preserved verbatim.
+	tr.SetLoaded("openai/weird-rank-x", []string{"m"})
+	if !tr.IsLoaded("openai/weird-rank-x", "m") {
+		t.Error("non-numeric -rank- suffix was wrongly stripped")
+	}
+}
+
 func TestTracker_AnyPodHasLoaded(t *testing.T) {
 	t.Parallel()
 
