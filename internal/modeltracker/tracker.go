@@ -66,11 +66,19 @@ const (
 	DefaultUnloadPath = "/models/unload"
 
 	// DefaultDedupGracePolls is how many consecutive polls a duplicate
-	// must be observed for before we act. At the default 10s poll, this
-	// works out to ~30s, enough for transient races (concurrent cold-
-	// load on two pods that both win the modelloader's MarkLoaded
-	// in the same window) to drain naturally.
-	DefaultDedupGracePolls = 3
+	// must be observed for before we act. At the default 10s poll,
+	// this works out to ~2 minutes, enough that:
+	//   - transient races (concurrent cold-load on two pods that both
+	//     win the modelloader's MarkLoaded in the same window) drain;
+	//   - an in-flight startup-verify call on the candidate loser pod
+	//     has had time to either finish (releasing the slot so unload
+	//     doesn't race with the request) or fail (so it doesn't get
+	//     immediately re-served by autoload);
+	//   - hindsight-api restart churn settles before we second-guess.
+	// At 30s we observed the same model being unloaded then auto-
+	// reloaded multiple times in 2 minutes because the dedup window
+	// fired before hindsight's restart-driven verify churn drained.
+	DefaultDedupGracePolls = 12
 
 	// MaxUnloadsPerCycle bounds how many duplicate-evictions we issue
 	// per poll cycle to avoid simultaneous reclaim across many models
