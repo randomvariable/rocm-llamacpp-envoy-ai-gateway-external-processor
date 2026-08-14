@@ -1,0 +1,23 @@
+internal/modeltracker/tracker.go
+  s_8cbe8c4c1893a7::t_02956cb0c0da31 133-136,369-371,379-385,390-395,718-727
+internal/plugins/modelloader/loader.go
+  s_8cbe8c4c1893a7::t_ef0e9b4cafb6af 111-117,125-126,174-175,189,201-203,286-299,414,419-424,563,567-570,577,581-582,585-587,591-592,602-604,613-615,626-628,643-645,659-661
+internal/plugins/modelloader/loader_test.go
+  s_8cbe8c4c1893a7::t_3ef3bc27c4bca7 1-305
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c4ccc1542aaa48ee9edd77e3cdc67e0f7a80491f",
+  "prompts": {},
+  "sessions": {
+    "s_8cbe8c4c1893a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1bc0b76-c45b-421b-a492-9dd4eee77349",
+        "model": "unknown"
+      },
+      "human_author": "Naadir Jeewa <naadir@randomvariable.co.uk>"
+    }
+  }
+}
