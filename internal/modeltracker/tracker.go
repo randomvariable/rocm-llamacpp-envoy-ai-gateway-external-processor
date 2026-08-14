@@ -130,6 +130,10 @@ type Tracker struct {
 	pressure        PressureProvider
 	dedupGracePolls int
 
+	// unloadObserver is notified after successful dedup unloads so cache
+	// owners can invalidate state that otherwise points at a cold backend.
+	unloadObserver func(podIP, model string)
+
 	mu sync.RWMutex
 	// loaded is keyed by pod IP — the same identifier the framework hands
 	// scheduling-path callers as the endpoint Address. Keying by IP (not
@@ -362,23 +366,33 @@ func (t *Tracker) MarkLoaded(podKey, model string) {
 }
 
 // MarkUnloaded is the inverse of MarkLoaded, used when a cold-load
-// attempt fails. Without it the in-band mark would persist until the
-// next poll and route traffic to a pod that doesn't actually have the
-// model loaded.
+// attempt fails or a dedup unload succeeds. Without it the in-band mark
+// would persist until the next poll and route traffic to a pod that
+// doesn't actually have the model loaded.
 func (t *Tracker) MarkUnloaded(podKey, model string) {
 	if podKey == "" || model == "" {
 		return
 	}
 
 	t.mu.Lock()
-	defer t.mu.Unlock()
-
 	set, ok := t.loaded[podKey]
+	if ok {
+		delete(set, model)
+	}
+	observer := t.unloadObserver
+	podIP := t.podIP[podKey]
+	t.mu.Unlock()
+
 	if !ok {
 		return
 	}
 
-	delete(set, model)
+	if observer != nil {
+		if podIP == "" {
+			podIP = podKey
+		}
+		observer(podIP, model)
+	}
 }
 
 // pollOnce lists the matching pods, queries each, and atomically
@@ -699,6 +713,16 @@ func (t *Tracker) pickLoser(holders []string) string {
 	}
 
 	return loser
+}
+
+// SetUnloadObserver registers a callback invoked after a successful dedup
+// unload. The modelloader uses this to invalidate its per-request cache;
+// without it, PreRequest can keep short-circuiting to a cold backend.
+func (t *Tracker) SetUnloadObserver(observer func(podIP, model string)) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.unloadObserver = observer
 }
 
 // unloadModel sends POST /models/unload {"model": "<id>"} to podIP.

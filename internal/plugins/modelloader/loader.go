@@ -108,6 +108,13 @@ var DefaultConfig = Config{
 	ConcurrentLoadLimit:     defaultConcurrentLoadLimit,
 }
 
+// loadResult coordinates one in-flight model load. The primary loader
+// closes done after storing err, so every waiter observes the same outcome.
+type loadResult struct {
+	done chan struct{}
+	err  error
+}
+
 // Plugin implements on-demand model loading for llamacpp instances.
 type Plugin struct {
 	typedName plugins.TypedName
@@ -115,8 +122,8 @@ type Plugin struct {
 
 	// Track loading state to prevent duplicate loads.
 	mu            sync.RWMutex
-	loadingModels map[string]chan struct{} // podIP:model -> completion channel
-	loadedModels  map[string]time.Time     // podIP:model -> load time
+	loadingModels map[string]*loadResult // podIP:model -> shared load result
+	loadedModels  map[string]time.Time   // podIP:model -> load time
 
 	// HTTP client for model server communication.
 	httpClient *http.Client
@@ -164,8 +171,8 @@ func ModelLoaderFactory(name string, rawParameters json.RawMessage, _ plugins.Ha
 	}
 
 	p := NewPlugin(name, config)
-	if loaderDeps != nil {
-		p.tracker = loaderDeps.Tracker
+	if loaderDeps != nil && loaderDeps.Tracker != nil {
+		p.WithTracker(loaderDeps.Tracker)
 	}
 
 	return p, nil
@@ -179,7 +186,7 @@ func NewPlugin(name string, config Config) *Plugin {
 			Name: name,
 		},
 		config:        config,
-		loadingModels: make(map[string]chan struct{}),
+		loadingModels: make(map[string]*loadResult),
 		loadedModels:  make(map[string]time.Time),
 		httpClient: &http.Client{
 			Timeout: time.Duration(config.ModelLoadTimeoutSeconds) * time.Second,
@@ -191,6 +198,9 @@ func NewPlugin(name string, config Config) *Plugin {
 // through the global deps path.
 func (p *Plugin) WithTracker(t *modeltracker.Tracker) *Plugin {
 	p.tracker = t
+	if t != nil {
+		t.SetUnloadObserver(p.InvalidateLoadedModel)
+	}
 
 	return p
 }
@@ -271,6 +281,20 @@ func (p *Plugin) markTrackerUnloaded(trackerKey, modelName string) {
 	}
 
 	p.tracker.MarkUnloaded(trackerKey, modelName)
+}
+
+// InvalidateLoadedModel removes one pod/model entry from the loader cache.
+// modeltracker calls this after a dedup unload so the next request reloads
+// the model instead of short-circuiting to a cold backend.
+func (p *Plugin) InvalidateLoadedModel(podIP, modelName string) {
+	if podIP == "" || modelName == "" {
+		return
+	}
+
+	loadKey := fmt.Sprintf("%s:%s", podIP, modelName)
+	p.mu.Lock()
+	delete(p.loadedModels, loadKey)
+	p.mu.Unlock()
 }
 
 // ClearLoadedModelsCache clears the loaded models cache.
@@ -387,12 +411,17 @@ func (p *Plugin) handleAlreadyLoadedOrLoading(ctx context.Context, loadKey, mode
 		return true
 	}
 
-	if waitCh, loading := p.loadingModels[loadKey]; loading {
+	if result, loading := p.loadingModels[loadKey]; loading {
 		p.mu.RUnlock()
 		klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s already loading on pod %s, waiting", modelName, podIP)
 
 		select {
-		case <-waitCh:
+		case <-result.done:
+			if result.err != nil {
+				klog.Warningf("ModelLoader.PreRequest: concurrent load of model %s on pod %s failed: %v; retrying", modelName, podIP, result.err)
+
+				return false
+			}
 			klog.V(logVerbosity).Infof("ModelLoader.PreRequest: model %s finished loading on pod %s", modelName, podIP)
 		case <-ctx.Done():
 			klog.Warning("ModelLoader.PreRequest: context cancelled while waiting for model load")
@@ -531,31 +560,36 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	// Create completion channel and register loading state.
 	p.mu.Lock()
 
-	if waitCh, loading := p.loadingModels[loadKey]; loading {
+	if result, loading := p.loadingModels[loadKey]; loading {
 		p.mu.Unlock()
 		klog.Infof("ModelLoader.loadModel: another goroutine is already loading %q, waiting", modelName)
-		// Another goroutine started loading - wait for it.
 		select {
-		case <-waitCh:
+		case <-result.done:
+			if result.err != nil {
+				return fmt.Errorf("concurrent model load failed: %w", result.err)
+			}
 			klog.Infof("ModelLoader.loadModel: concurrent load of %q completed", modelName)
 
 			return nil
 		case <-ctx.Done():
 			klog.Infof("ModelLoader.loadModel: context cancelled while waiting for concurrent load")
 
-			return fmt.Errorf("context cancelled while waiting for model load: %w", ctx.Err())
+			return fmt.Errorf("context cancelled while waiting for concurrent load: %w", ctx.Err())
 		}
 	}
 
-	completionCh := make(chan struct{})
-	p.loadingModels[loadKey] = completionCh
+	result := &loadResult{done: make(chan struct{})}
+	p.loadingModels[loadKey] = result
 	p.mu.Unlock()
 
-	// Ensure cleanup on completion.
+	// Publish the primary load result before cleanup so every concurrent
+	// request observes the same failure instead of forwarding to a cold backend.
+	var loadErr error
 	defer func() {
 		p.mu.Lock()
 		delete(p.loadingModels, loadKey)
-		close(completionCh)
+		result.err = loadErr
+		close(result.done)
 		p.mu.Unlock()
 	}()
 
@@ -565,7 +599,9 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 		"model": modelName,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to marshal request body: %w", err)
+		loadErr = fmt.Errorf("failed to marshal request body: %w", err)
+
+		return loadErr
 	}
 
 	klog.Infof("ModelLoader.loadModel: POST %s with body: %s", url, string(requestBody))
@@ -574,7 +610,9 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	if err != nil {
 		klog.Infof("ModelLoader.loadModel: failed to create request: %v", err)
 
-		return fmt.Errorf("failed to create load request: %w", err)
+		loadErr = fmt.Errorf("failed to create load request: %w", err)
+
+		return loadErr
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -585,7 +623,9 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	if err != nil {
 		klog.Infof("ModelLoader.loadModel: request failed: %v", err)
 
-		return fmt.Errorf("model load request failed: %w", err)
+		loadErr = fmt.Errorf("model load request failed: %w", err)
+
+		return loadErr
 	}
 
 	defer func() {
@@ -600,7 +640,9 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	klog.Infof("ModelLoader.loadModel: response status=%d, body=%s", resp.StatusCode, string(respBody))
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("%w: status %d: %s", ErrModelLoadFailed, resp.StatusCode, string(respBody))
+		loadErr = fmt.Errorf("%w: status %d: %s", ErrModelLoadFailed, resp.StatusCode, string(respBody))
+
+		return loadErr
 	}
 
 	// llama-server's /models/load is async — it returns 200
@@ -614,7 +656,9 @@ func (p *Plugin) loadModel(ctx context.Context, podIP, modelName string) error {
 	// safety net) — autoload would otherwise paper over the race.
 	waitErr := p.waitForModelLoaded(ctx, podIP, modelName)
 	if waitErr != nil {
-		return fmt.Errorf("wait for model %q to load on %s: %w", modelName, podIP, waitErr)
+		loadErr = fmt.Errorf("wait for model %q to load on %s: %w", modelName, podIP, waitErr)
+
+		return loadErr
 	}
 
 	// Mark model as loaded.
